@@ -50,12 +50,20 @@ func newIdleHTTP2ClientConn(t *testing.T) (*h2TestServer, *http2.ClientConn) {
 	}
 
 	// 与 createConnection 保持同款配置，确保测试覆盖的是生产路径的参数。
-	tr := &http2.Transport{
-		ReadIdleTimeout: codexHTTP2ReadIdleTimeout,
-		PingTimeout:     codexHTTP2PingTimeout,
-		IdleConnTimeout: codexUTLSIdleConnTimeout,
-		AllowHTTP:       true,
+	// 注意：Go 1.27 起 http2.Transport 包裹 net/http.Transport，必须经
+	// http2.ConfigureTransports 绑定底层 transport，否则 NewClientConn 会
+	// 因内部 t1 为 nil 而 panic。
+	t1 := &http.Transport{}
+	tr, err := http2.ConfigureTransports(t1)
+	if err != nil {
+		_ = rawConn.Close()
+		server.Close()
+		t.Fatalf("ConfigureTransports: %v", err)
 	}
+	tr.ReadIdleTimeout = codexHTTP2ReadIdleTimeout
+	tr.PingTimeout = codexHTTP2PingTimeout
+	tr.IdleConnTimeout = codexUTLSIdleConnTimeout
+	tr.AllowHTTP = true
 	clientConn, err := tr.NewClientConn(rawConn)
 	if err != nil {
 		_ = rawConn.Close()

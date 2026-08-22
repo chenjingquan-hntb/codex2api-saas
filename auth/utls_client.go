@@ -117,11 +117,19 @@ func (t *utlsAuthRoundTripper) createConnection(host, addr string) (*http2.Clien
 	// 认证 transport 自管 HTTP/2 连接，不经过 net/http 的连接池。三项超时
 	// 必须直接配置在 http2.Transport 上：否则健康空闲连接不会安装回收计时器，
 	// readLoop、socket 与缓冲区会一直驻留。
-	tr := &http2.Transport{
-		ReadIdleTimeout: utlsAuthReadIdleTimeout,
-		PingTimeout:     utlsAuthPingTimeout,
-		IdleConnTimeout: utlsAuthIdleConnTimeout,
+	//
+	// Go 1.27 起 x/net/http2 把 http2.Transport 改为包裹 net/http.Transport，
+	// NewClientConn 经内部 t1 走标准库；直接 &http2.Transport{} 会因 t1 为 nil
+	// 而 panic，必须用 http2.ConfigureTransports 拿到绑定底层 transport 的实例。
+	t1 := &http.Transport{}
+	tr, err := http2.ConfigureTransports(t1)
+	if err != nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("HTTP/2 配置失败: %w", err)
 	}
+	tr.ReadIdleTimeout = utlsAuthReadIdleTimeout
+	tr.PingTimeout = utlsAuthPingTimeout
+	tr.IdleConnTimeout = utlsAuthIdleConnTimeout
 	h2Conn, err := tr.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()

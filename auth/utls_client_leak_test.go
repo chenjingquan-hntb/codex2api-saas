@@ -32,7 +32,18 @@ func newIdleAuthHTTP2ClientConn(t *testing.T) (*http.Server, net.Listener, *http
 		t.Fatalf("dial: %v", err)
 	}
 
-	transport := &http2.Transport{AllowHTTP: true}
+	// Go 1.27 起 http2.Transport 包裹 net/http.Transport，NewClientConn 经内部
+	// t1 走标准库；直接 &http2.Transport{} 会因 t1 为 nil 而 panic，需先
+	// ConfigureTransports 绑定底层 transport。
+	t1 := &http.Transport{}
+	transport, err := http2.ConfigureTransports(t1)
+	if err != nil {
+		_ = rawConn.Close()
+		_ = server.Close()
+		_ = listener.Close()
+		t.Fatalf("ConfigureTransports: %v", err)
+	}
+	transport.AllowHTTP = true
 	clientConn, err := transport.NewClientConn(rawConn)
 	if err != nil {
 		_ = rawConn.Close()
