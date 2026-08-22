@@ -542,6 +542,12 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user_created ON wallet_transactions(user_id, created_at);`,
+		`CREATE TABLE IF NOT EXISTS system_setting_values (
+			key TEXT PRIMARY KEY,
+			value_json TEXT NOT NULL DEFAULT '{}',
+			updated_by INTEGER NOT NULL DEFAULT 0,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {

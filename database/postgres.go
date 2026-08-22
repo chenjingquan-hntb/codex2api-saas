@@ -1639,6 +1639,15 @@ func (db *DB) migrate(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user_created ON wallet_transactions(user_id, created_at);
 
+	-- 控制面 JSON 配置（钱包计费 / SMTP / 易支付 / Turnstile / GeoIP 等），
+	-- 与旧单行 system_settings 标量列分离，按 key 存整段 JSON。
+	CREATE TABLE IF NOT EXISTS system_setting_values (
+		key        TEXT PRIMARY KEY,
+		value_json TEXT NOT NULL DEFAULT '{}',
+		updated_by BIGINT NOT NULL DEFAULT 0,
+		updated_at TIMESTAMPTZ DEFAULT NOW()
+	);
+
 	-- api_keys 归属用户与摘要化存储（旧明文 Key 双读迁移，不删旧列）
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS user_id BIGINT NOT NULL DEFAULT 0;
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_hash VARCHAR(64) DEFAULT '';
@@ -1692,6 +1701,7 @@ type APIKeyRow struct {
 	ID              int64        `json:"id"`
 	Name            string       `json:"name"`
 	Key             string       `json:"key"`
+	UserID          int64        `json:"user_id"`
 	QuotaLimit      float64      `json:"quota_limit"`
 	QuotaUsed       float64      `json:"quota_used"`
 	TotalUsed       float64      `json:"total_used"`
@@ -1844,7 +1854,7 @@ type APIKeyUpdate struct {
 	LimitsSet          bool
 }
 
-const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}')`
+const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}'), COALESCE(user_id, 0)`
 
 // ListAPIKeys 获取所有 API 密钥
 func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
