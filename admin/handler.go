@@ -84,6 +84,8 @@ type Handler struct {
 	cacheLabel                string
 	adminSecretEnv            string
 	userMailer                userMailer
+	turnstileVerifier         turnstileVerifier
+	geoipResolver             geoipResolver
 	registerLimiter           *keyedRateLimiter
 	loginIPLimiter            *keyedRateLimiter
 	loginEmailLimiter         *keyedRateLimiter
@@ -942,6 +944,8 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		cacheLabel:           tc.Label(),
 		adminSecretEnv:       adminSecretEnv,
 		userMailer:           &smtpMailer{db: db},
+		turnstileVerifier:    httpTurnstileVerifier{client: &http.Client{Timeout: turnstileVerifyWait}},
+		geoipResolver:        newHTTPGeoIPResolver(),
 		registerLimiter:      newKeyedRateLimiter(userRegisterRateLimit, userRegisterRateWin),
 		loginIPLimiter:       newKeyedRateLimiter(userLoginRateLimit, userLoginRateWin),
 		loginEmailLimiter:    newKeyedRateLimiter(userLoginEmailRateLimit, userLoginRateWin),
@@ -1028,6 +1032,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	// 门户用户认证（P5/P6 控制面）。公开端点自带限流；
 	// 需登录端点走 requireUserSession（HttpOnly 会话 Cookie）。
 	authAPI := r.Group("/api/auth")
+	authAPI.Use(h.geoIPGate())          // 地区准入（未启用时放行）
+	authAPI.Use(h.turnstileGate())      // 人机校验（未启用时放行）
 	authAPI.POST("/register", h.RegisterUser)
 	authAPI.POST("/verify-email", h.VerifyEmail)
 	authAPI.POST("/resend-verification", h.ResendVerification)
@@ -1037,6 +1043,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	authAPI.POST("/password-reset", h.ResetPassword)
 
 	authAuthed := r.Group("/api/auth")
+	authAuthed.Use(h.geoIPGate()) // 已登录端点同样受地区准入约束
 	authAuthed.Use(h.requireUserSession())
 	authAuthed.POST("/logout", h.LogoutUser)
 	authAuthed.GET("/me", h.GetCurrentUser)
