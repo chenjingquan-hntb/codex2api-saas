@@ -405,7 +405,7 @@ func (db *DB) ListAPIKeyAccountStats(ctx context.Context, apiKeyID int64, rangeS
 		SELECT
 			u.account_id,
 			COALESCE(a.name, '') AS account_name,
-			COALESCE(CAST(a.credentials AS TEXT), '{}') AS credentials,
+			COALESCE(a.email, '') AS account_email,
 			COALESCE(a.status, '') AS account_status,
 			COALESCE(a.error_message, '') AS account_error,
 			u.requests, u.input_tokens, u.output_tokens, u.cached_tokens,
@@ -424,13 +424,13 @@ func (db *DB) ListAPIKeyAccountStats(ctx context.Context, apiKeyID int64, rangeS
 	items := make([]APIKeyAccountStat, 0, 16)
 	for rows.Next() {
 		var item APIKeyAccountStat
-		var credentials string
+		var accountEmail string
 		var accountStatus string
 		var accountError string
 		if err := rows.Scan(
 			&item.AccountID,
 			&item.AccountName,
-			&credentials,
+			&accountEmail,
 			&accountStatus,
 			&accountError,
 			&item.Requests,
@@ -444,7 +444,7 @@ func (db *DB) ListAPIKeyAccountStats(ctx context.Context, apiKeyID int64, rangeS
 		); err != nil {
 			return nil, err
 		}
-		item.AccountEmail = emailFromCredentialsJSON(credentials)
+		item.AccountEmail = accountEmail
 		item.AccountDeleted = strings.EqualFold(strings.TrimSpace(accountStatus), "deleted") ||
 			strings.EqualFold(strings.TrimSpace(accountError), "deleted")
 		items = append(items, item)

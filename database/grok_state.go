@@ -421,7 +421,7 @@ func credentialFamilyCandidate(credentials map[string]any) string {
 }
 
 func (db *DB) backfillCredentialFamilies(ctx context.Context) error {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, credentials FROM accounts WHERE COALESCE(credential_family_id, '') = ''`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT id, `+storedCredentialsExpr()+` FROM accounts WHERE COALESCE(credential_family_id, '') = ''`)
 	if err != nil {
 		return err
 	}
@@ -437,7 +437,7 @@ func (db *DB) backfillCredentialFamilies(ctx context.Context) error {
 			rows.Close()
 			return err
 		}
-		family := credentialFamilyCandidate(decodeCredentials(raw))
+		family := credentialFamilyCandidate(db.decodeStoredCredentials(raw))
 		if family == "" {
 			family = "cf_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 		}
@@ -456,7 +456,7 @@ func (db *DB) backfillCredentialFamilies(ctx context.Context) error {
 
 func (db *DB) backfillCredentialFamiliesBatch(ctx context.Context, tx *sql.Tx, limit int) (int, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id,credentials FROM accounts
+		SELECT id,`+storedCredentialsExpr()+` FROM accounts
 		WHERE COALESCE(credential_family_id,'')=''
 		ORDER BY id LIMIT $1`, limit)
 	if err != nil {
@@ -474,7 +474,7 @@ func (db *DB) backfillCredentialFamiliesBatch(ctx context.Context, tx *sql.Tx, l
 			rows.Close()
 			return 0, err
 		}
-		family := credentialFamilyCandidate(decodeCredentials(raw))
+		family := credentialFamilyCandidate(db.decodeStoredCredentials(raw))
 		if family == "" {
 			family = "cf_" + strings.ReplaceAll(uuid.NewString(), "-", "")
 		}
@@ -551,7 +551,7 @@ func (db *DB) InsertGrokAccountIfAbsent(ctx context.Context, name string, creden
 	if len(identityKeys) == 0 {
 		return 0, 0, errors.New("grok credential has no stable identity")
 	}
-	encoded, err := json.Marshal(credentialCopy)
+	insertFields, err := db.buildCredentialsWriteFields(credentialCopy)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -563,8 +563,14 @@ func (db *DB) InsertGrokAccountIfAbsent(ctx context.Context, name string, creden
 		}
 		defer tx.Rollback()
 
+		// (name, platform, type, <credentials fragment>, proxy_url, enabled)
+		credColumns, credPlaceholders, credArgs := db.credentialsInsertFragment(2, insertFields)
 		if db.isSQLite() {
-			result, insertErr := tx.ExecContext(ctx, `INSERT INTO accounts(name,platform,type,credentials,proxy_url,enabled) VALUES($1,'xai','grok',$2,$3,$4)`, name, encoded, proxyURL, enabled)
+			query := `INSERT INTO accounts(name,platform,type,` + credColumns + `,proxy_url,enabled) VALUES(?, 'xai', 'grok', ` + credPlaceholders + `, ?, ?)`
+			args := []any{name}
+			args = append(args, credArgs...)
+			args = append(args, proxyURL, enabled)
+			result, insertErr := tx.ExecContext(ctx, query, args...)
 			if insertErr != nil {
 				return insertErr
 			}
@@ -572,8 +578,14 @@ func (db *DB) InsertGrokAccountIfAbsent(ctx context.Context, name string, creden
 			if insertErr != nil {
 				return insertErr
 			}
-		} else if insertErr := tx.QueryRowContext(ctx, `INSERT INTO accounts(name,platform,type,credentials,proxy_url,enabled) VALUES($1,'xai','grok',$2::jsonb,$3,$4) RETURNING id`, name, encoded, proxyURL, enabled).Scan(&accountID); insertErr != nil {
-			return insertErr
+		} else {
+			query := `INSERT INTO accounts(name,platform,type,` + credColumns + `,proxy_url,enabled) VALUES($1, 'xai', 'grok', ` + credPlaceholders + `, $13, $14) RETURNING id`
+			args := []any{name}
+			args = append(args, credArgs...)
+			args = append(args, proxyURL, enabled)
+			if insertErr := tx.QueryRowContext(ctx, query, args...).Scan(&accountID); insertErr != nil {
+				return insertErr
+			}
 		}
 		if _, updateErr := tx.ExecContext(ctx, `UPDATE accounts SET credential_family_id=$1 WHERE id=$2`, familyID, accountID); updateErr != nil {
 			return updateErr
@@ -628,7 +640,7 @@ func (db *DB) ReauthGrokAccount(ctx context.Context, accountID int64, credential
 		}
 		defer tx.Rollback()
 
-		selectQuery := `SELECT credentials, status, COALESCE(error_message,''), deleted_at IS NOT NULL FROM accounts WHERE id=$1`
+		selectQuery := `SELECT ` + storedCredentialsExpr() + `, status, COALESCE(error_message,''), deleted_at IS NOT NULL FROM accounts WHERE id=$1`
 		if !db.isSQLite() {
 			selectQuery += ` FOR UPDATE`
 		}
@@ -638,7 +650,7 @@ func (db *DB) ReauthGrokAccount(ctx context.Context, accountID int64, credential
 		if scanErr := tx.QueryRowContext(ctx, selectQuery, accountID).Scan(&currentRaw, &status, &errorMessage, &deleted); scanErr != nil {
 			return scanErr
 		}
-		existing := decodeCredentials(currentRaw)
+		existing := db.decodeStoredCredentials(currentRaw)
 		if !strings.EqualFold(strings.TrimSpace(credentialStringFromMap(existing, "upstream_type")), "grok") {
 			return fmt.Errorf("账号 %d 不是 Grok 账号,不能承接 Grok 重授权", accountID)
 		}
@@ -665,15 +677,14 @@ func (db *DB) ReauthGrokAccount(ctx context.Context, accountID int64, credential
 			}
 		}
 
-		encoded, marshalErr := json.Marshal(merged)
-		if marshalErr != nil {
-			return marshalErr
+		updateQuery, updateArgs, updateErr := db.buildAccountUpdateSQL(merged,
+			[]accountSetField{{column: "credential_family_id", value: familyID}},
+			`updated_at = CURRENT_TIMESTAMP`,
+			[]accountWhereField{{column: "id", value: accountID}}, "")
+		if updateErr != nil {
+			return updateErr
 		}
-		credentialsExpr := "$1"
-		if !db.isSQLite() {
-			credentialsExpr = "$1::jsonb"
-		}
-		if _, updateErr := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE accounts SET credentials=%s, credential_family_id=$2, updated_at=CURRENT_TIMESTAMP WHERE id=$3`, credentialsExpr), encoded, familyID, accountID); updateErr != nil {
+		if _, updateErr := tx.ExecContext(ctx, updateQuery, updateArgs...); updateErr != nil {
 			return updateErr
 		}
 		if name = strings.TrimSpace(name); name != "" {
@@ -707,7 +718,7 @@ func (db *DB) ReauthGrokAccount(ctx context.Context, accountID int64, credential
 // deployment already contains duplicates: those rows remain available for
 // operators to reconcile, while all new imports are atomically fenced.
 func (db *DB) backfillGrokCredentialIdentityClaims(ctx context.Context) error {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id,credentials,credential_family_id FROM accounts ORDER BY id`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT id,`+storedCredentialsExpr()+`,credential_family_id FROM accounts ORDER BY id`)
 	if err != nil {
 		return err
 	}
@@ -724,7 +735,7 @@ func (db *DB) backfillGrokCredentialIdentityClaims(ctx context.Context) error {
 			rows.Close()
 			return err
 		}
-		credentials := decodeCredentials(raw)
+		credentials := db.decodeStoredCredentials(raw)
 		if !strings.EqualFold(strings.TrimSpace(credentialStringFromMap(credentials, "upstream_type")), "grok") {
 			continue
 		}
@@ -744,9 +755,9 @@ func (db *DB) backfillGrokCredentialIdentityClaims(ctx context.Context) error {
 }
 
 func (db *DB) backfillGrokCredentialIdentityClaimsBatch(ctx context.Context, tx *sql.Tx, afterID int64, limit int) (processed int, nextID int64, err error) {
-	query := `SELECT id,credentials,credential_family_id FROM accounts WHERE id>$1 ORDER BY id LIMIT $2`
+	query := `SELECT id,` + storedCredentialsExpr() + `,credential_family_id FROM accounts WHERE id>$1 ORDER BY id LIMIT $2`
 	if !db.isSQLite() {
-		query = `SELECT id,credentials,credential_family_id FROM accounts WHERE id>$1 AND LOWER(COALESCE(credentials->>'upstream_type',''))='grok' ORDER BY id LIMIT $2`
+		query = `SELECT id,` + storedCredentialsExpr() + `,credential_family_id FROM accounts WHERE id>$1 AND LOWER(COALESCE(upstream_type,''))='grok' ORDER BY id LIMIT $2`
 	}
 	rows, err := tx.QueryContext(ctx, query, afterID, limit)
 	if err != nil {
@@ -767,7 +778,7 @@ func (db *DB) backfillGrokCredentialIdentityClaimsBatch(ctx context.Context, tx 
 		}
 		nextID = accountID
 		processed++
-		credentials := decodeCredentials(raw)
+		credentials := db.decodeStoredCredentials(raw)
 		if db.isSQLite() && !strings.EqualFold(strings.TrimSpace(credentialStringFromMap(credentials, "upstream_type")), "grok") {
 			continue
 		}
@@ -823,7 +834,7 @@ func (db *DB) UpdateAccountCredentialsCAS(ctx context.Context, accountID, expect
 			return beginErr
 		}
 		defer tx.Rollback()
-		query := `SELECT credentials, credential_generation FROM accounts WHERE id=$1 AND status <> 'deleted'`
+		query := `SELECT ` + storedCredentialsExpr() + `, credential_generation FROM accounts WHERE id=$1 AND status <> 'deleted'`
 		if !db.isSQLite() {
 			query += ` FOR UPDATE`
 		}
@@ -836,15 +847,17 @@ func (db *DB) UpdateAccountCredentialsCAS(ctx context.Context, accountID, expect
 			newGeneration = current
 			return nil
 		}
-		encoded, marshalErr := json.Marshal(mergeCredentialMaps(decodeCredentials(raw), updates))
-		if marshalErr != nil {
-			return marshalErr
+		merged := mergeCredentialMaps(db.decodeStoredCredentials(raw), updates)
+		updateQuery, updateArgs, updateErr := db.buildAccountUpdateSQL(merged, nil,
+			`credential_generation = credential_generation + 1, updated_at = CURRENT_TIMESTAMP`,
+			[]accountWhereField{
+				{column: "id", value: accountID},
+				{column: "credential_generation", value: expectedGeneration},
+			}, "")
+		if updateErr != nil {
+			return updateErr
 		}
-		updateQuery := `UPDATE accounts SET credentials=$1, credential_generation=credential_generation+1, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND credential_generation=$3`
-		if !db.isSQLite() {
-			updateQuery = `UPDATE accounts SET credentials=$1::jsonb, credential_generation=credential_generation+1, updated_at=NOW() WHERE id=$2 AND credential_generation=$3`
-		}
-		res, execErr := tx.ExecContext(ctx, updateQuery, encoded, accountID, expectedGeneration)
+		res, execErr := tx.ExecContext(ctx, updateQuery, updateArgs...)
 		if execErr != nil {
 			return execErr
 		}
@@ -916,7 +929,7 @@ func (db *DB) MergeAccountCredentialsForGeneration(ctx context.Context, accountI
 			return beginErr
 		}
 		defer tx.Rollback()
-		query := `SELECT credentials, credential_generation FROM accounts WHERE id=$1 AND status <> 'deleted'`
+		query := `SELECT ` + storedCredentialsExpr() + `, credential_generation FROM accounts WHERE id=$1 AND status <> 'deleted'`
 		if !db.isSQLite() {
 			query += ` FOR UPDATE`
 		}
@@ -928,15 +941,17 @@ func (db *DB) MergeAccountCredentialsForGeneration(ctx context.Context, accountI
 		if current != expectedGeneration {
 			return nil
 		}
-		encoded, marshalErr := json.Marshal(mergeCredentialMaps(decodeCredentials(raw), filtered))
-		if marshalErr != nil {
-			return marshalErr
+		merged := mergeCredentialMaps(db.decodeStoredCredentials(raw), filtered)
+		update, updateArgs, updateErr := db.buildAccountUpdateSQL(merged, nil,
+			`updated_at = CURRENT_TIMESTAMP`,
+			[]accountWhereField{
+				{column: "id", value: accountID},
+				{column: "credential_generation", value: expectedGeneration},
+			}, "")
+		if updateErr != nil {
+			return updateErr
 		}
-		update := `UPDATE accounts SET credentials=$1, updated_at=CURRENT_TIMESTAMP WHERE id=$2 AND credential_generation=$3`
-		if !db.isSQLite() {
-			update = `UPDATE accounts SET credentials=$1::jsonb, updated_at=NOW() WHERE id=$2 AND credential_generation=$3`
-		}
-		result, execErr := tx.ExecContext(ctx, update, encoded, accountID, expectedGeneration)
+		result, execErr := tx.ExecContext(ctx, update, updateArgs...)
 		if execErr != nil {
 			return execErr
 		}
@@ -1562,10 +1577,10 @@ func (db *DB) GetGrokModelCapabilities(ctx context.Context, accountID int64) ([]
 func (db *DB) GetGrokAccountState(ctx context.Context, accountID int64) (*GrokAccountState, error) {
 	state := &GrokAccountState{AccountID: accountID, Facts: map[string]GrokAccountFact{}}
 	var raw any
-	if err := db.conn.QueryRowContext(ctx, `SELECT credential_generation,credential_family_id,credentials FROM accounts WHERE id=$1`, accountID).Scan(&state.CredentialGeneration, &state.Identity.CredentialFamilyID, &raw); err != nil {
+	if err := db.conn.QueryRowContext(ctx, `SELECT credential_generation,credential_family_id,`+storedCredentialsExpr()+` FROM accounts WHERE id=$1`, accountID).Scan(&state.CredentialGeneration, &state.Identity.CredentialFamilyID, &raw); err != nil {
 		return nil, err
 	}
-	credentials := decodeCredentials(raw)
+	credentials := db.decodeStoredCredentials(raw)
 	state.Identity.JWTTier = strings.TrimSpace(credentialStringFromMap(credentials, "jwt_plan_type"))
 	state.Identity.ArchivePlan = strings.TrimSpace(credentialStringFromMap(credentials, "archive_plan_type"))
 	if state.Identity.ArchivePlan != "" {

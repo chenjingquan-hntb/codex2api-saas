@@ -221,6 +221,50 @@ func TestEpayNotifyCreditsOnce(t *testing.T) {
 	}
 }
 
+func TestEpayNotifyIgnoresNonSuccessTradeStatus(t *testing.T) {
+	statuses := []struct {
+		name   string
+		status string
+	}{
+		{name: "pending", status: "TRADE_PENDING"},
+		{name: "failed", status: "TRADE_FAILED"},
+		{name: "missing", status: ""},
+	}
+	for _, tc := range statuses {
+		t.Run(tc.name, func(t *testing.T) {
+			h, db, cookies, userID := setupEpayTest(t)
+			rec := doJSON(t, h, http.MethodPost, "/api/auth/wallet/recharge",
+				`{"amount_micro":100000}`, cookies)
+			orderNo := gjson.Get(rec.Body.String(), "order_no").String()
+
+			form := epayCallbackParams(orderNo, "0.01")
+			if tc.status == "" {
+				form.Del("trade_status")
+			} else {
+				form.Set("trade_status", tc.status)
+			}
+			form.Set("sign", epaySign(formToMap(form), testEpayKey))
+			rec = doForm(t, h, http.MethodPost, "/api/pay/epay/notify", form)
+			if rec.Code != http.StatusOK || rec.Body.String() != "success" {
+				t.Fatalf("non-success notify = %d %q", rec.Code, rec.Body.String())
+			}
+
+			acc, err := db.GetWalletAccount(t.Context(), userID)
+			if err != nil || (acc != nil && (acc.AvailableMicro != 0 || acc.ReservedMicro != 0)) {
+				t.Fatalf("wallet changed: %+v err=%v", acc, err)
+			}
+			order, err := db.GetRechargeOrder(t.Context(), userID, orderNo)
+			if err != nil || order == nil || order.Status != database.RechargeOrderStatusPending {
+				t.Fatalf("order must remain pending: %+v err=%v", order, err)
+			}
+			ledger, err := db.ListWalletLedger(t.Context(), userID, 10, 0)
+			if err != nil || len(ledger) != 0 {
+				t.Fatalf("ledger must stay empty: entries=%d err=%v", len(ledger), err)
+			}
+		})
+	}
+}
+
 func TestEpayNotifyRejectsBadSign(t *testing.T) {
 	h, db, cookies, userID := setupEpayTest(t)
 
@@ -240,6 +284,35 @@ func TestEpayNotifyRejectsBadSign(t *testing.T) {
 	}
 }
 
+func TestEpayNotifyFailureRateLimit(t *testing.T) {
+	h, _, cookies, _ := setupEpayTest(t)
+	rec := doJSON(t, h, http.MethodPost, "/api/auth/wallet/recharge",
+		`{"amount_micro":100000}`, cookies)
+	orderNo := gjson.Get(rec.Body.String(), "order_no").String()
+
+	for i := 0; i < epayCallbackFailureLimit; i++ {
+		form := epayCallbackParams(orderNo, "0.01")
+		form.Set("sign", "deadbeef")
+		rec = doForm(t, h, http.MethodPost, "/api/pay/epay/notify", form)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("bad callback #%d status=%d body=%q", i, rec.Code, rec.Body.String())
+		}
+	}
+	// 达到失败阈值后，即使后续报文签名正确，也先对该来源短暂限流。
+	rec = doForm(t, h, http.MethodPost, "/api/pay/epay/notify", epayCallbackParams(orderNo, "0.01"))
+	if rec.Code != http.StatusTooManyRequests || rec.Body.String() != "fail" {
+		t.Fatalf("rate limited notify=%d %q", rec.Code, rec.Body.String())
+	}
+	if got := h.epayBadSignCount.Load(); got != epayCallbackFailureLimit {
+		t.Fatalf("bad sign count=%d", got)
+	}
+	if got := h.epayRejectedCount.Load(); got != epayCallbackFailureLimit {
+		t.Fatalf("rejected count=%d", got)
+	}
+	if got := h.epayRateLimitedCount.Load(); got != 1 {
+		t.Fatalf("rate limited count=%d", got)
+	}
+}
 func TestEpayNotifyRejectsAmountMismatch(t *testing.T) {
 	h, db, cookies, userID := setupEpayTest(t)
 

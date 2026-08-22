@@ -529,6 +529,21 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			UNIQUE(user_id, idempotency_key)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user_created ON wallet_ledger_entries(user_id, created_at);`,
+		`CREATE TABLE IF NOT EXISTS wallet_settlement_intents (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			reference_type TEXT NOT NULL,
+			reference_id TEXT NOT NULL,
+			reserved_micro INTEGER NOT NULL,
+			actual_micro INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL,
+			retry_count INTEGER NOT NULL DEFAULT 0,
+			last_error TEXT NOT NULL DEFAULT '',
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(reference_type, reference_id)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_wallet_settlement_status_updated ON wallet_settlement_intents(status, updated_at);`,
 		`CREATE TABLE IF NOT EXISTS wallet_transactions (
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			user_id INTEGER NOT NULL,
@@ -830,6 +845,19 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"accounts", "image_quota_total", "INTEGER NULL"},
 		{"accounts", "today_used_count", "INTEGER DEFAULT 0"},
 		{"accounts", "image_quota_reset_at", "TEXT NULL"},
+		// B0 凭证加密整改：密文/密钥版本/投影列。SQL 过滤/索引不再依赖
+		// json_extract(credentials, ...) 明文 JSON 表达式。
+		{"accounts", "credentials_enc", "TEXT DEFAULT ''"},
+		{"accounts", "cred_key_version", "INTEGER NOT NULL DEFAULT 0"},
+		{"accounts", "credentials_projection_version", "INTEGER NOT NULL DEFAULT 0"},
+		{"accounts", "upstream_type", "TEXT DEFAULT ''"},
+		{"accounts", "email", "TEXT DEFAULT ''"},
+		{"accounts", "base_url", "TEXT DEFAULT ''"},
+		{"accounts", "plan_type", "TEXT DEFAULT ''"},
+		{"accounts", "cred_models", "TEXT DEFAULT '[]'"},
+		{"accounts", "has_api_key", "INTEGER DEFAULT 0"},
+		{"accounts", "has_refresh_token", "INTEGER DEFAULT 0"},
+		{"accounts", "scheduler_priority", "TEXT DEFAULT ''"},
 		{"proxies", "test_ip", "TEXT DEFAULT ''"},
 		{"proxies", "test_location", "TEXT DEFAULT ''"},
 		{"proxies", "test_latency_ms", "INTEGER DEFAULT 0"},
@@ -870,10 +898,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		`CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);`,
 		`CREATE INDEX IF NOT EXISTS idx_accounts_platform ON accounts(platform);`,
 		`CREATE INDEX IF NOT EXISTS idx_accounts_cooldown_until ON accounts(cooldown_until);`,
-		`CREATE INDEX IF NOT EXISTS idx_accounts_upstream_type_id ON accounts(LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')), id);`,
-		`CREATE INDEX IF NOT EXISTS idx_accounts_active_upstream_type_id ON accounts(LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')), id) WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted';`,
+		// B0 整改：旧 JSON 表达式索引在凭证加密后失去意义，先删后建投影列索引。
+		`DROP INDEX IF EXISTS idx_accounts_upstream_type_id;`,
+		`DROP INDEX IF EXISTS idx_accounts_active_upstream_type_id;`,
+		`CREATE INDEX IF NOT EXISTS idx_accounts_upstream_type_id ON accounts(LOWER(COALESCE(upstream_type, '')), id);`,
+		`CREATE INDEX IF NOT EXISTS idx_accounts_active_upstream_type_id ON accounts(LOWER(COALESCE(upstream_type, '')), id) WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted';`,
 		`CREATE INDEX IF NOT EXISTS idx_accounts_created_id ON accounts(created_at, id);`,
 		`CREATE INDEX IF NOT EXISTS idx_accounts_updated_id ON accounts(updated_at, id);`,
+		`CREATE INDEX IF NOT EXISTS idx_accounts_email ON accounts(LOWER(COALESCE(email, '')));`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_created_at ON usage_logs(created_at);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_id ON usage_logs(account_id);`,
 		`CREATE INDEX IF NOT EXISTS idx_usage_logs_account_created_at ON usage_logs(account_id, created_at);`,
@@ -921,7 +953,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		return err
 	}
 
-	return db.runDataMigrationsWithTimeout()
+	return nil
 }
 
 // rebuildWalletLedgerIdempotencySQLite 把旧版 wallet_ledger_entries 的单列

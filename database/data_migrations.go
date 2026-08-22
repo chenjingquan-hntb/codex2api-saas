@@ -3,7 +3,6 @@ package database
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
@@ -60,10 +59,7 @@ func (db *DB) runDataMigrations(ctx context.Context) error {
 // classifyAccountGroupChannels 把成员清一色是 Grok 账号的存量分组归到 grok 渠道。
 // 混合组保持 codex 且成员不动(只在后续写入时强校验),避免迁移悄悄拆散生产分组。
 func (db *DB) classifyAccountGroupChannels(ctx context.Context, tx *sql.Tx) error {
-	upstreamTypeExpr := `LOWER(COALESCE(a.credentials->>'upstream_type', ''))`
-	if db.isSQLite() {
-		upstreamTypeExpr = `LOWER(COALESCE(json_extract(a.credentials, '$.upstream_type'), ''))`
-	}
+	upstreamTypeExpr := `LOWER(COALESCE(a.upstream_type, ''))`
 	res, err := tx.ExecContext(ctx, `
 		UPDATE account_groups SET channel = 'grok'
 		WHERE COALESCE(channel, 'codex') <> 'grok' AND id IN (
@@ -267,15 +263,11 @@ func (db *DB) migrateWorkspaceIdentityV3(ctx context.Context, tx *sql.Tx) error 
 			)
 			if workspaceID != "" && strings.EqualFold(tokenEmail, email) {
 				account.credentials["workspace_id"] = workspaceID
-				encoded, err := json.Marshal(account.credentials)
-				if err != nil {
-					return err
+				updateQuery, updateArgs, updateErr := db.buildAccountUpdateSQL(account.credentials, nil, "updated_at = CURRENT_TIMESTAMP", []accountWhereField{{column: "id", value: account.id}}, "")
+				if updateErr != nil {
+					return updateErr
 				}
-				query := `UPDATE accounts SET credentials = $1 WHERE id = $2`
-				if !db.isSQLite() {
-					query = `UPDATE accounts SET credentials = $1::jsonb WHERE id = $2`
-				}
-				if _, err := tx.ExecContext(ctx, query, encoded, account.id); err != nil {
+				if _, err := tx.ExecContext(ctx, updateQuery, updateArgs...); err != nil {
 					return err
 				}
 			}
@@ -333,7 +325,7 @@ func workspaceIdentityDedupeKey(credentials map[string]interface{}) string {
 
 func (db *DB) listOAuthIdentityDedupeAccounts(ctx context.Context, tx *sql.Tx) ([]oauthIdentityDedupeAccount, error) {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT id, credentials, COALESCE(enabled, true), COALESCE(locked, false), created_at, updated_at
+		SELECT id, `+storedCredentialsExpr()+`, COALESCE(enabled, true), COALESCE(locked, false), created_at, updated_at
 		FROM accounts
 		WHERE status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'
 	`)
@@ -358,7 +350,7 @@ func (db *DB) listOAuthIdentityDedupeAccounts(ctx context.Context, tx *sql.Tx) (
 		); err != nil {
 			return nil, err
 		}
-		account.credentials = decodeCredentials(rawCredentials)
+		account.credentials = db.decodeStoredCredentials(rawCredentials)
 		account.createdAt, err = parseDBTimeValue(createdRaw)
 		if err != nil {
 			return nil, fmt.Errorf("解析账号 %d created_at 失败: %w", account.id, err)

@@ -3,6 +3,8 @@ package admin
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -250,12 +252,21 @@ func (h *Handler) ReconcileAdminPayments(c *gin.Context) {
 		return
 	}
 	var req struct {
-		DryRun *bool `json:"dry_run"`
+		DryRun  *bool  `json:"dry_run"`
+		Confirm string `json:"confirm"`
+		Reason  string `json:"reason"`
 	}
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		writeError(c, http.StatusBadRequest, "请求体格式错误")
+		return
+	}
 	dryRun := true
 	if req.DryRun != nil {
 		dryRun = *req.DryRun
+	}
+	if !dryRun && (strings.TrimSpace(req.Confirm) != "RECONCILE_FIX" || strings.TrimSpace(req.Reason) == "") {
+		writeError(c, http.StatusBadRequest, "自动修复必须提供 confirm=RECONCILE_FIX 和 reason")
+		return
 	}
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
@@ -264,27 +275,32 @@ func (h *Handler) ReconcileAdminPayments(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
-	fixed := 0
+	fixed, conflicts := 0, 0
+	operator := c.GetString("admin_auth_fingerprint")
+	requestID := security.SanitizeLog(c.GetHeader("X-Request-ID"))
+	reason := security.SanitizeLog(strings.TrimSpace(req.Reason))
 	if !dryRun {
 		for i := range drifts {
-			if err := h.db.FixWalletBalance(ctx, drifts[i].UserID, drifts[i].ExpectedMicro); err != nil {
-				writeInternalError(c, err)
+			d := drifts[i]
+			ok, fixErr := h.db.FixWalletBalanceIfUnchanged(ctx, d)
+			if fixErr != nil {
+				writeInternalError(c, fixErr)
 				return
 			}
+			if !ok {
+				conflicts++
+				security.SecurityAuditLog("ADMIN_PAYMENT_RECONCILE_CONFLICT", fmt.Sprintf("user_id=%d before=%d expected=%d reserved=%d version=%d operator=%s request_id=%s ip=%s", d.UserID, d.ActualMicro, d.ExpectedMicro, d.ReservedMicro, d.Version, operator, requestID, security.SanitizeLog(c.ClientIP())))
+				continue
+			}
 			fixed++
+			security.SecurityAuditLog("ADMIN_PAYMENT_RECONCILE_FIX", fmt.Sprintf("user_id=%d before=%d expected=%d diff=%d reserved=%d version=%d operator=%s request_id=%s reason=%s ip=%s", d.UserID, d.ActualMicro, d.ExpectedMicro, d.DiffMicro, d.ReservedMicro, d.Version, operator, requestID, reason, security.SanitizeLog(c.ClientIP())))
 		}
 	}
-	security.SecurityAuditLog("ADMIN_PAYMENT_RECONCILE",
-		"drifts="+strconv.Itoa(len(drifts))+" dry_run="+strconv.FormatBool(dryRun)+
-			" fixed="+strconv.Itoa(fixed)+" ip="+security.SanitizeLog(c.ClientIP()))
+	security.SecurityAuditLog("ADMIN_PAYMENT_RECONCILE", fmt.Sprintf("drifts=%d dry_run=%t fixed=%d conflicts=%d operator=%s request_id=%s ip=%s", len(drifts), dryRun, fixed, conflicts, operator, requestID, security.SanitizeLog(c.ClientIP())))
 	if drifts == nil {
 		drifts = []database.BalanceDrift{}
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"dry_run": dryRun,
-		"fixed":   fixed,
-		"drifts":  drifts,
-	})
+	c.JSON(http.StatusOK, gin.H{"dry_run": dryRun, "fixed": fixed, "conflicts": conflicts, "drifts": drifts})
 }
 
 // ==================== 小工具 ====================

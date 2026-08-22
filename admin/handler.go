@@ -63,36 +63,47 @@ type Handler struct {
 	// last/in-flight 避免翻页或前端重试把同一号打爆上游，failedAt 给持续
 	// 失败的账号更长的冷却，syncedOnce 记录「成功同步过但上游没有数据」
 	// （官方统计有滞后），让 page-stats 下发显式空态而不是无限触发回补。
-	whamDailyBackfillMu       sync.Mutex
-	whamDailyBackfillLast     map[int64]time.Time
-	whamDailyBackfillInFlight map[int64]struct{}
-	whamDailyBackfillFailedAt map[int64]time.Time
-	whamDailySyncedOnce       map[int64]struct{}
-	recordAccountEvent        func(int64, string, string)
-	proxyProbe                func(context.Context, string, string) proxyProbeResult
-	reloadProxyPoolFn         func() error
-	proxyBatchEventSender     func(*gin.Context, proxyBatchTestEvent) bool
-	proxyBatchTestMu          sync.Mutex
-	cpuSampler                *cpuSampler
-	memReader                 memStatsReader
-	startedAt                 time.Time
-	pgMaxConns                int
-	redisPoolSize             int
-	databaseDriver            string
-	databaseLabel             string
-	cacheDriver               string
-	cacheLabel                string
-	adminSecretEnv            string
-	userMailer                userMailer
-	turnstileVerifier         turnstileVerifier
-	geoipResolver             geoipResolver
-	registerLimiter           *keyedRateLimiter
-	loginIPLimiter            *keyedRateLimiter
-	loginEmailLimiter         *keyedRateLimiter
-	resendLimiter             *keyedRateLimiter
-	resetReqLimiter           *keyedRateLimiter
-	invalidateWalletCfgCache  func() // 数据面计费配置缓存失效（main.go 注入 proxy.Handler）
-	imageProxy                *proxy.Handler
+	whamDailyBackfillMu        sync.Mutex
+	whamDailyBackfillLast      map[int64]time.Time
+	whamDailyBackfillInFlight  map[int64]struct{}
+	whamDailyBackfillFailedAt  map[int64]time.Time
+	whamDailySyncedOnce        map[int64]struct{}
+	recordAccountEvent         func(int64, string, string)
+	proxyProbe                 func(context.Context, string, string) proxyProbeResult
+	reloadProxyPoolFn          func() error
+	proxyBatchEventSender      func(*gin.Context, proxyBatchTestEvent) bool
+	proxyBatchTestMu           sync.Mutex
+	cpuSampler                 *cpuSampler
+	memReader                  memStatsReader
+	startedAt                  time.Time
+	pgMaxConns                 int
+	redisPoolSize              int
+	databaseDriver             string
+	databaseLabel              string
+	cacheDriver                string
+	cacheLabel                 string
+	adminSecretEnv             string
+	userMailer                 userMailer
+	turnstileVerifier          turnstileVerifier
+	geoipResolver              geoipResolver
+	registerLimiter            *keyedRateLimiter
+	loginIPLimiter             *keyedRateLimiter
+	loginEmailLimiter          *keyedRateLimiter
+	resendLimiter              *keyedRateLimiter
+	resetReqLimiter            *keyedRateLimiter
+	epayCallbackFailureLimiter *keyedRateLimiter
+	epayBadSignCount           atomic.Int64
+	epayRejectedCount          atomic.Int64
+	epayRateLimitedCount       atomic.Int64
+	financialHealthMu          sync.Mutex
+	financialHealthAt          time.Time
+	financialHealthDB          financialHealthDBSnapshot
+	credentialsHealthMu        sync.Mutex
+	credentialsHealthAt        time.Time
+	credentialsPlaintextRows   int64
+	credentialsHealthErr       string
+	invalidateWalletCfgCache   func() // 数据面计费配置缓存失效（main.go 注入 proxy.Handler）
+	imageProxy                 *proxy.Handler
 
 	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
 	// 在大文件导入时堆出成千上万个阻塞协程。
@@ -935,30 +946,31 @@ func parseUsageChannel(c *gin.Context) string {
 // NewHandler 创建管理后台处理器
 func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *proxy.RateLimiter, adminSecretEnv string) *Handler {
 	handler := &Handler{
-		store:                store,
-		cache:                tc,
-		db:                   db,
-		cacheCfgStore:        db,
-		rateLimiter:          rl,
-		cpuSampler:           newCPUSampler(),
-		startedAt:            time.Now(),
-		databaseDriver:       db.Driver(),
-		databaseLabel:        db.Label(),
-		cacheDriver:          tc.Driver(),
-		cacheLabel:           tc.Label(),
-		adminSecretEnv:       adminSecretEnv,
-		userMailer:           &smtpMailer{db: db},
-		turnstileVerifier:    httpTurnstileVerifier{client: &http.Client{Timeout: turnstileVerifyWait}},
-		geoipResolver:        newHTTPGeoIPResolver(),
-		registerLimiter:      newKeyedRateLimiter(userRegisterRateLimit, userRegisterRateWin),
-		loginIPLimiter:       newKeyedRateLimiter(userLoginRateLimit, userLoginRateWin),
-		loginEmailLimiter:    newKeyedRateLimiter(userLoginEmailRateLimit, userLoginRateWin),
-		resendLimiter:        newKeyedRateLimiter(userResendRateLimit, userResendRateWin),
-		resetReqLimiter:      newKeyedRateLimiter(userResetReqRateLimit, userResetReqRateWin),
-		imageProxy:           proxy.NewHandler(store, db, nil, nil),
-		chartCacheData:       make(map[string]*chartCacheEntry),
-		accountListCache:     make(map[string]*accountListSnapshot),
-		accountAnalysisCache: make(map[string]*accountAnalysisCacheEntry),
+		store:                      store,
+		cache:                      tc,
+		db:                         db,
+		cacheCfgStore:              db,
+		rateLimiter:                rl,
+		cpuSampler:                 newCPUSampler(),
+		startedAt:                  time.Now(),
+		databaseDriver:             db.Driver(),
+		databaseLabel:              db.Label(),
+		cacheDriver:                tc.Driver(),
+		cacheLabel:                 tc.Label(),
+		adminSecretEnv:             adminSecretEnv,
+		userMailer:                 &smtpMailer{db: db},
+		turnstileVerifier:          httpTurnstileVerifier{client: &http.Client{Timeout: turnstileVerifyWait}},
+		geoipResolver:              newHTTPGeoIPResolver(),
+		registerLimiter:            newKeyedRateLimiter(userRegisterRateLimit, userRegisterRateWin),
+		loginIPLimiter:             newKeyedRateLimiter(userLoginRateLimit, userLoginRateWin),
+		loginEmailLimiter:          newKeyedRateLimiter(userLoginEmailRateLimit, userLoginRateWin),
+		resendLimiter:              newKeyedRateLimiter(userResendRateLimit, userResendRateWin),
+		resetReqLimiter:            newKeyedRateLimiter(userResetReqRateLimit, userResetReqRateWin),
+		epayCallbackFailureLimiter: newKeyedRateLimiter(epayCallbackFailureLimit, epayCallbackFailureWindow),
+		imageProxy:                 proxy.NewHandler(store, db, nil, nil),
+		chartCacheData:             make(map[string]*chartCacheEntry),
+		accountListCache:           make(map[string]*accountListSnapshot),
+		accountAnalysisCache:       make(map[string]*accountAnalysisCacheEntry),
 	}
 	if handler.imageProxy != nil {
 		handler.imageProxy.SetRuntimeCache(tc)
@@ -1044,8 +1056,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	// 门户用户认证（P5/P6 控制面）。公开端点自带限流；
 	// 需登录端点走 requireUserSession（HttpOnly 会话 Cookie）。
 	authAPI := r.Group("/api/auth")
-	authAPI.Use(h.geoIPGate())          // 地区准入（未启用时放行）
-	authAPI.Use(h.turnstileGate())      // 人机校验（未启用时放行）
+	authAPI.Use(h.geoIPGate())     // 地区准入（未启用时放行）
+	authAPI.Use(h.turnstileGate()) // 人机校验（未启用时放行）
 	authAPI.POST("/register", h.RegisterUser)
 	authAPI.POST("/verify-email", h.VerifyEmail)
 	authAPI.POST("/resend-verification", h.ResendVerification)
@@ -1357,6 +1369,11 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+
+		// 共享管理密钥没有天然的管理员账号身份；仅记录不可逆指纹，
+		// 供资金操作审计关联，绝不记录密钥本身。
+		adminKeySum := sha256.Sum256([]byte(adminKey))
+		c.Set("admin_auth_fingerprint", hex.EncodeToString(adminKeySum[:])[:16])
 
 		// 成功认证，记录审计日志
 		if security.IsSensitiveEndpoint(c.Request.URL.Path) {

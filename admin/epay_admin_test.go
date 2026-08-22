@@ -249,12 +249,17 @@ func TestAdminPaymentReconcileAPI(t *testing.T) {
 	if got := gjson.Get(rec.Body.String(), "fixed").Int(); got != 0 {
 		t.Fatalf("fixed = %d", got)
 	}
-	// 显式 dry_run=false 且无差异：fixed=0。
+	// 自动修复必须显式二次确认和原因，即使当前没有差异。
 	rec = doAdmin(t, h, http.MethodPost, "/api/admin/payments/reconcile", `{"dry_run":false}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("reconcile fix without confirmation status = %d", rec.Code)
+	}
+	rec = doAdmin(t, h, http.MethodPost, "/api/admin/payments/reconcile", `{"dry_run":false,"confirm":"RECONCILE_FIX","reason":"scheduled verification"}`)
 	if rec.Code != http.StatusOK {
-		t.Fatalf("reconcile fix status = %d", rec.Code)
+		t.Fatalf("reconcile confirmed fix status = %d body=%s", rec.Code, rec.Body.String())
 	}
 	if got := gjson.Get(rec.Body.String(), "fixed").Int(); got != 0 {
 		t.Fatalf("fixed = %d", got)
 	}
+
 }

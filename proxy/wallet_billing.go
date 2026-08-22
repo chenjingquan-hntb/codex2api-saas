@@ -206,20 +206,18 @@ func (h *Handler) walletBeginBilling(c *gin.Context, row *database.APIKeyRow) bo
 		RefType:        walletRequestRefType,
 		RefID:          reqID,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), walletOpTimeout)
-	defer cancel()
-	// 注意：WalletReserve 返回 (replayed, err)；成功时 err==nil（replayed=false）。
-	replayed, err := h.db.WalletReserve(ctx, st.UserID, deposit, st.RefType, st.RefID, "reserve:"+reqID)
+
+	reserveCtx, reserveCancel := context.WithTimeout(context.Background(), walletOpTimeout)
+	replayed, err := h.db.WalletReserve(reserveCtx, st.UserID, deposit, st.RefType, st.RefID, "reserve:"+reqID)
+	reserveCancel()
 	if err != nil {
 		if errors.Is(err, database.ErrInsufficientBalance) {
-			// 确认余额不足：402 Payment Required。
 			security.SecurityAuditLog("WALLET_RESERVE_INSUFFICIENT",
 				fmt.Sprintf("user_id=%d path=%s ip=%s", st.UserID, c.Request.URL.Path, c.ClientIP()))
 			api.SendError(c, api.ErrInsufficientBalance)
 			c.Abort()
 			return false
 		}
-		// fail-closed：钱包 DB 故障 → 拒绝计费请求，不放行。
 		security.SecurityAuditLog("WALLET_RESERVE_UNAVAILABLE",
 			fmt.Sprintf("user_id=%d path=%s ip=%s err=%v", st.UserID, c.Request.URL.Path, c.ClientIP(), err))
 		api.SendError(c, api.ErrServiceUnavailable)
@@ -227,9 +225,28 @@ func (h *Handler) walletBeginBilling(c *gin.Context, row *database.APIKeyRow) bo
 		return false
 	}
 	if replayed {
-		// 全新 per-request 键理论上不会重放；若发生直接按成功处理（已预留）。
 		log.Printf("钱包预留意外重放(user=%d ref=%s)", st.UserID, reqID)
 	}
+
+	// 预留成功后、调用上游前必须持久化结算义务。若 intent 无法落库，立即尝试
+	// 释放并 fail-closed；绝不把一个无法追踪结算的请求发送给上游。
+	intentCtx, intentCancel := context.WithTimeout(context.Background(), walletOpTimeout)
+	err = h.db.CreateWalletSettlementIntent(intentCtx, st.UserID, st.DepositMicro, st.RefType, st.RefID)
+	intentCancel()
+	if err != nil {
+		releaseCtx, releaseCancel := context.WithTimeout(context.Background(), walletOpTimeout)
+		_, releaseErr := h.db.WalletRelease(releaseCtx, st.UserID, st.DepositMicro, st.RefType, st.RefID, "release:"+st.RefID)
+		releaseCancel()
+		detail := fmt.Sprintf("user=%d ref=%s create_error=%s", st.UserID, st.RefID, security.SanitizeLog(err.Error()))
+		if releaseErr != nil {
+			detail += " release_error=" + security.SanitizeLog(releaseErr.Error())
+		}
+		security.SecurityAuditLog("WALLET_SETTLEMENT_INTENT_CREATE_FAILED", detail)
+		api.SendError(c, api.ErrServiceUnavailable)
+		c.Abort()
+		return false
+	}
+
 	c.Set(walletBillingStateKey, st)
 	return true
 }
@@ -273,9 +290,18 @@ func (h *Handler) finalizeWalletRequest(c *gin.Context) {
 
 	actual := st.total()
 	if actual <= 0 {
-		// 无成功用量 → 全额释放。
+		// 先把释放义务持久化，再执行余额变动。任一步失败都保留 reserved，
+		// 后台只对 release_pending 做幂等重试。
+		if err := h.db.PrepareWalletRelease(ctx, st.UserID, st.DepositMicro, st.RefType, st.RefID); err != nil {
+			h.recordWalletSettlementFailure(ctx, st, "prepare_release", err)
+			return
+		}
 		if _, err := h.db.WalletRelease(ctx, st.UserID, st.DepositMicro, st.RefType, st.RefID, "release:"+st.RefID); err != nil {
-			log.Printf("钱包释放失败(user=%d ref=%s): %v", st.UserID, st.RefID, err)
+			h.recordWalletSettlementFailure(ctx, st, "release", err)
+			return
+		}
+		if err := h.db.CompleteWalletSettlementIntent(ctx, st.UserID, st.RefType, st.RefID, database.WalletSettlementReleased); err != nil {
+			h.recordWalletSettlementFailure(ctx, st, "complete_release", err)
 		}
 		return
 	}
@@ -285,26 +311,31 @@ func (h *Handler) finalizeWalletRequest(c *gin.Context) {
 	if st.ChargeCapMicro > 0 && actual > st.ChargeCapMicro {
 		actual = st.ChargeCapMicro
 	}
-	if _, err := h.db.WalletSettle(ctx, st.UserID, st.DepositMicro, actual, st.RefType, st.RefID, "settle:"+st.RefID); err == nil {
+
+	// 成功用量先落 settle_pending(actual)，再执行钱包结算。结算失败绝不释放
+	// 预留，后台依靠同一幂等键继续完成扣款。
+	if err := h.db.PrepareWalletSettlement(ctx, st.UserID, st.DepositMicro, actual, st.RefType, st.RefID); err != nil {
+		h.recordWalletSettlementFailure(ctx, st, "prepare_settle", err)
 		return
-	} else {
-		log.Printf("钱包结算失败(user=%d ref=%s actual=%d): %v", st.UserID, st.RefID, actual, err)
 	}
-	// 兜底：多退少补失败（通常余额不足以补差）时，最多消耗到预留额度；
-	// 仍失败则最终释放，本次请求免单（账本保持不变量，审计见日志）。
-	capActual := actual
-	if capActual > st.DepositMicro {
-		capActual = st.DepositMicro
+	if _, err := h.db.WalletSettle(ctx, st.UserID, st.DepositMicro, actual, st.RefType, st.RefID, "settle:"+st.RefID); err != nil {
+		h.recordWalletSettlementFailure(ctx, st, "settle", err)
+		return
 	}
-	if capActual <= 0 {
-		capActual = st.DepositMicro
+	if err := h.db.CompleteWalletSettlementIntent(ctx, st.UserID, st.RefType, st.RefID, database.WalletSettlementSettled); err != nil {
+		h.recordWalletSettlementFailure(ctx, st, "complete_settle", err)
 	}
-	if _, err := h.db.WalletSettle(ctx, st.UserID, st.DepositMicro, capActual, st.RefType, st.RefID, "settle:"+st.RefID); err != nil {
-		log.Printf("钱包结算兜底失败(user=%d ref=%s): %v", st.UserID, st.RefID, err)
-		if _, err2 := h.db.WalletRelease(ctx, st.UserID, st.DepositMicro, st.RefType, st.RefID, "release:"+st.RefID); err2 != nil {
-			log.Printf("钱包释放兜底失败(user=%d ref=%s): %v", st.UserID, st.RefID, err2)
-		}
+}
+
+func (h *Handler) recordWalletSettlementFailure(ctx context.Context, st *walletRequestState, phase string, cause error) {
+	if h == nil || h.db == nil || st == nil || cause == nil {
+		return
 	}
+	_ = h.db.RecordWalletSettlementFailure(ctx, st.UserID, st.RefType, st.RefID, cause)
+	security.SecurityAuditLog("WALLET_SETTLEMENT_CRITICAL",
+		fmt.Sprintf("phase=%s user=%d ref=%s reserved_micro=%d error=%s",
+			phase, st.UserID, st.RefID, st.DepositMicro, security.SanitizeLog(cause.Error())))
+	log.Printf("钱包结算流程失败，保留预留等待补偿(phase=%s user=%d ref=%s): %v", phase, st.UserID, st.RefID, cause)
 }
 
 // newWalletRequestID 生成 per-request 随机 ID（账本幂等键的一部分）。
@@ -333,6 +364,16 @@ func StartWalletReconciliation(ctx context.Context, db *database.DB, interval, o
 	run := func(why string) {
 		reconcileCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 		defer cancel()
+		// 先重试已明确持久化的结算/释放义务，再处理没有 intent 的真实孤儿。
+		retry, retryErr := db.RetryWalletSettlementIntents(reconcileCtx, 500)
+		if retryErr != nil {
+			log.Printf("钱包结算补偿重试失败(%s): %v", why, retryErr)
+		} else if retry.Settled > 0 || retry.Released > 0 || retry.Failed > 0 {
+			security.SecurityAuditLog("WALLET_SETTLEMENT_RETRY",
+				fmt.Sprintf("settled=%d released=%d failed=%d", retry.Settled, retry.Released, retry.Failed))
+			log.Printf("钱包结算补偿(%s): settled=%d released=%d failed=%d", why, retry.Settled, retry.Released, retry.Failed)
+		}
+
 		n, micro, err := db.ReconcileOrphanedWalletReservations(reconcileCtx, orphanAge, 500)
 		if err != nil {
 			log.Printf("钱包孤儿预留对账失败(%s): %v", why, err)
@@ -342,6 +383,13 @@ func StartWalletReconciliation(ctx context.Context, db *database.DB, interval, o
 			security.SecurityAuditLog("WALLET_ORPHAN_RESERVATION_RECOVERED",
 				fmt.Sprintf("count=%d micro=%d", n, micro))
 			log.Printf("钱包孤儿预留对账(%s): 恢复 %d 条预留, 合计 %d 微元", why, n, micro)
+		}
+		if metrics, metricErr := db.GetWalletSettlementMetrics(reconcileCtx, orphanAge); metricErr != nil {
+			log.Printf("钱包结算指标读取失败(%s): %v", why, metricErr)
+		} else if metrics.SettlePending > 0 || metrics.ReleasePending > 0 || metrics.StaleInFlight > 0 {
+			security.SecurityAuditLog("WALLET_SETTLEMENT_BACKLOG",
+				fmt.Sprintf("in_flight=%d settle_pending=%d release_pending=%d retried=%d stale_in_flight=%d",
+					metrics.InFlight, metrics.SettlePending, metrics.ReleasePending, metrics.Retried, metrics.StaleInFlight))
 		}
 		// 充值订单到期清理：把已过支付截止时间仍未支付（pending）的订单标记 expired。
 		expiredN, expErr := db.ExpireStaleRechargeOrders(reconcileCtx, 0, 200)

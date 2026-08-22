@@ -40,19 +40,19 @@ const (
 
 // 端点限流（内存滑动窗口；够用即可，后续可上 Redis 计数）。
 const (
-	userRegisterRateLimit    = 5
-	userRegisterRateWin      = time.Hour
-	userLoginRateLimit       = 30
-	userLoginEmailRateLimit  = 10
-	userLoginRateWin         = 15 * time.Minute
-	userResendRateLimit      = 3
-	userResendRateWin        = time.Hour
-	userResetReqRateLimit    = 3
-	userResetReqRateWin      = time.Hour
+	userRegisterRateLimit   = 5
+	userRegisterRateWin     = time.Hour
+	userLoginRateLimit      = 30
+	userLoginEmailRateLimit = 10
+	userLoginRateWin        = 15 * time.Minute
+	userResendRateLimit     = 3
+	userResendRateWin       = time.Hour
+	userResetReqRateLimit   = 3
+	userResetReqRateWin     = time.Hour
 )
 
 var (
-	// 各端点限流器实例挂在 Handler 上（NewHandler 初始化），避免包级共享状态污染测试。
+// 各端点限流器实例挂在 Handler 上（NewHandler 初始化），避免包级共享状态污染测试。
 )
 
 // userMailer 邮件发送抽象；SMTP 实现在下一步接入。
@@ -107,6 +107,26 @@ func (l *keyedRateLimiter) allow(key string, now time.Time) bool {
 	return true
 }
 
+// blocked 只检查 key 当前是否已耗尽配额，不记录一次新命中。用于只对失败请求
+// 计数的端点：请求进入时先检查，确认失败后再调用 allow 记账。
+func (l *keyedRateLimiter) blocked(key string, now time.Time) bool {
+	if l == nil {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.gcIfDue(now)
+	cutoff := now.Add(-l.win)
+	kept := l.hits[key][:0]
+	for _, t := range l.hits[key] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	l.hits[key] = kept
+	return len(kept) >= l.limit
+}
+
 // gcIfDue 每经过一个窗口周期清扫一次：删除已无记录的 key，防止长运行下 map 无界增长。
 func (l *keyedRateLimiter) gcIfDue(now time.Time) {
 	if l.lastGC.IsZero() {
@@ -155,6 +175,7 @@ func sessionFromGin(c *gin.Context) *database.UserSession {
 // 双路径：
 //  1. Authorization: Bearer <access_token>（无状态本地验签，零 DB 查询；新前端首选）
 //  2. 兼容路径：HttpOnly 会话 Cookie（查 DB，测试与旧前端继续可用）
+//
 // 若带 Bearer 但无效，直接 401 不回落 Cookie，避免过期 token 被 Cookie 路径放行。
 func (h *Handler) requireUserSession() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -582,14 +603,14 @@ func (h *Handler) GetCurrentUser(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"user_id":     user.ID,
-		"email":       user.Email,
-		"role":        user.Role,
-		"status":      user.Status,
-		"verified":    user.EmailVerified(),
-		"created_at":  user.CreatedAt.UTC().Format(time.RFC3339),
-		"last_login":  formatOptionalTime(user.LastLoginAt),
-		"session_id":  sess.ID,
+		"user_id":    user.ID,
+		"email":      user.Email,
+		"role":       user.Role,
+		"status":     user.Status,
+		"verified":   user.EmailVerified(),
+		"created_at": user.CreatedAt.UTC().Format(time.RFC3339),
+		"last_login": formatOptionalTime(user.LastLoginAt),
+		"session_id": sess.ID,
 	})
 }
 

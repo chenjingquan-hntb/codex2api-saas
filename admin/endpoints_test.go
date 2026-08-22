@@ -38,6 +38,9 @@ func doEndpoint(t *testing.T, h *Handler, method, path, body string) *httptest.R
 
 func TestHealthz(t *testing.T) {
 	h, _ := newEndpointTestHandler(t)
+	h.epayBadSignCount.Store(2)
+	h.epayRejectedCount.Store(3)
+	h.epayRateLimitedCount.Store(1)
 	r := gin.New()
 	h.RegisterRoutes(r)
 
@@ -52,6 +55,21 @@ func TestHealthz(t *testing.T) {
 	}
 	if got := gjson.Get(rec.Body.String(), "dependencies.postgres").String(); got != "ok" {
 		t.Fatalf("postgres dep = %q", got)
+	}
+	if got := gjson.Get(rec.Body.String(), "dependencies.financial").String(); got != "ok" {
+		t.Fatalf("financial dep = %q body=%s", got, rec.Body.String())
+	}
+	if got := gjson.Get(rec.Body.String(), "dependencies.credentials_encryption").String(); got != "plaintext" {
+		t.Fatalf("credentials_encryption dep = %q body=%s", got, rec.Body.String())
+	}
+	if got := gjson.Get(rec.Body.String(), "financial.epay_bad_sign").Int(); got != 2 {
+		t.Fatalf("epay_bad_sign = %d", got)
+	}
+	if got := gjson.Get(rec.Body.String(), "financial.epay_rejected").Int(); got != 3 {
+		t.Fatalf("epay_rejected = %d", got)
+	}
+	if got := gjson.Get(rec.Body.String(), "financial.epay_rate_limited").Int(); got != 1 {
+		t.Fatalf("epay_rate_limited = %d", got)
 	}
 
 	// DB 故障 → 503 down。
@@ -288,6 +306,9 @@ func TestAdminGroupEndpointBindingAndOverview(t *testing.T) {
 
 func TestHealthzWalletWriteMode(t *testing.T) {
 	h, _ := newEndpointTestHandler(t)
+	h.epayBadSignCount.Store(2)
+	h.epayRejectedCount.Store(3)
+	h.epayRateLimitedCount.Store(1)
 	r := gin.New()
 	h.RegisterRoutes(r)
 

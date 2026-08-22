@@ -72,7 +72,7 @@ const (
 
 // apiKeyCacheTTL 是 API key 运行态缓存 TTL（P7.2 TTL 兜底：广播丢消息时
 // 撤销在最长 TTL 内扩散到全节点）。可经 CODEX_API_KEY_CACHE_TTL 配置缩短
-//（默认 5m，最小 30s；越短撤销越即时、代价是更多 DB 回源）。
+// （默认 5m，最小 30s；越短撤销越即时、代价是更多 DB 回源）。
 func apiKeyCacheTTL() time.Duration {
 	raw := strings.TrimSpace(os.Getenv("CODEX_API_KEY_CACHE_TTL"))
 	if raw == "" {
@@ -1074,10 +1074,10 @@ func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool, error) {
 			Key:  key,
 		}, true, nil
 	}
-	if row, ok := h.resolveAPIKeyFromRuntimeCache(key); ok {
-		h.syncAPIKeyAllowedGroups(row)
-		return row, true, nil
-	}
+	// Redis/内存运行态缓存只允许作为性能提示，绝不能作为鉴权权威。
+	// 任何命中都必须回源数据库再次确认 key 存在、active、归属及限制，
+	// 否则缓存写入漏洞会直接变成免费调用上游的漏洞。
+	cached, cachedOK := h.resolveAPIKeyFromRuntimeCache(key)
 	if h.db == nil {
 		return nil, false, nil
 	}
@@ -1096,7 +1096,13 @@ func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool, error) {
 	if row.Status != "" && row.Status != database.APIKeyStatusActive {
 		return nil, false, nil
 	}
-	h.setAPIKeyRuntimeCache(row)
+	if cachedOK && (cached.ID != row.ID || cached.UserID != row.UserID) {
+		keyHash := database.HashAPIKeySecret(key)
+		security.SecurityAuditLog("API_KEY_RUNTIME_CACHE_MISMATCH",
+			fmt.Sprintf("key_hash=%s cached_id=%d db_id=%d cached_user=%d db_user=%d",
+				keyHash[:16], cached.ID, row.ID, cached.UserID, row.UserID))
+	}
+	h.setAPIKeyRuntimeCache(row, key)
 	h.syncAPIKeyAllowedGroups(row)
 	return row, true, nil
 }
@@ -1107,22 +1113,14 @@ func (h *Handler) resolveAPIKeyFromRuntimeCache(key string) (*database.APIKeyRow
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	raw, ok, err := h.cache.GetRuntime(ctx, apiKeyCacheNamespace, key)
+	// 只读取摘要键，不再读取/新建明文 API Key 缓存键。
+	raw, ok, err := h.cache.GetRuntime(ctx, apiKeyCacheNamespace, database.HashAPIKeySecret(key))
 	if err != nil {
 		log.Printf("读取 API Key Redis 缓存失败: %v", err)
 		return nil, false
 	}
 	if !ok || len(raw) == 0 {
-		// 用户自建 key 以摘要为缓存键，兼容历史明文键：双键都试一次。
-		hashed := database.HashAPIKeySecret(key)
-		raw, ok, err = h.cache.GetRuntime(ctx, apiKeyCacheNamespace, hashed)
-		if err != nil {
-			log.Printf("读取 API Key Redis 缓存失败: %v", err)
-			return nil, false
-		}
-		if !ok || len(raw) == 0 {
-			return nil, false
-		}
+		return nil, false
 	}
 	var record apiKeyRuntimeRecord
 	if err := json.Unmarshal(raw, &record); err != nil {
@@ -1141,8 +1139,8 @@ func (h *Handler) resolveAPIKeyFromRuntimeCache(key string) (*database.APIKeyRow
 	}, true
 }
 
-func (h *Handler) setAPIKeyRuntimeCache(row *database.APIKeyRow) {
-	if h == nil || h.cache == nil || row == nil || strings.TrimSpace(row.Key) == "" || row.ID <= 0 {
+func (h *Handler) setAPIKeyRuntimeCache(row *database.APIKeyRow, presentedKey string) {
+	if h == nil || h.cache == nil || row == nil || strings.TrimSpace(presentedKey) == "" || row.ID <= 0 {
 		return
 	}
 	if row.HasAccessConstraints() {
@@ -1160,11 +1158,8 @@ func (h *Handler) setAPIKeyRuntimeCache(row *database.APIKeyRow) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	// 缓存键：用户自建 key 用摘要（撤销时可按 row.Key 精确失效），历史 key 用明文。
-	cacheKey := row.Key
-	if row.KeyHash != "" {
-		cacheKey = row.KeyHash
-	}
+	// 永远只用请求 key 的摘要作为缓存键，避免长期 API Key 出现在 Redis keyspace。
+	cacheKey := database.HashAPIKeySecret(presentedKey)
 	if err := h.cache.SetRuntime(ctx, apiKeyCacheNamespace, cacheKey, payload, apiKeyCacheTTL()); err != nil {
 		log.Printf("写入 API Key Redis 缓存失败: id=%d err=%v", row.ID, err)
 	}

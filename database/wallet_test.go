@@ -400,6 +400,100 @@ func TestWalletReconcileOrphanedReservations(t *testing.T) {
 	}
 }
 
+func TestWalletSettlementIntentProtectsReservationAndRetriesSettle(t *testing.T) {
+	db := newWalletTestDB(t)
+	ctx := context.Background()
+	const userID = 41
+	const refID = "settlement-protected"
+
+	if _, err := db.WalletCredit(ctx, userID, 10*testYuan, WalletTxRecharge, "order", "credit-41", "credit:41", 0, ""); err != nil {
+		t.Fatalf("credit: %v", err)
+	}
+	if _, err := db.WalletReserve(ctx, userID, 2*testYuan, "request", refID, "reserve:"+refID); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := db.CreateWalletSettlementIntent(ctx, userID, 2*testYuan, "request", refID); err != nil {
+		t.Fatalf("create intent: %v", err)
+	}
+	old := db.timeArg(time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+	if _, err := db.conn.ExecContext(ctx, `UPDATE wallet_ledger_entries SET created_at=$1 WHERE user_id=$2 AND reference_type='request' AND reference_id=$3`, old, userID, refID); err != nil {
+		t.Fatalf("age reservation: %v", err)
+	}
+
+	// 即使预留已经远超孤儿阈值，只要存在 intent 就绝不能自动释放。
+	n, micro, err := db.ReconcileOrphanedWalletReservations(ctx, time.Hour, 100)
+	if err != nil || n != 0 || micro != 0 {
+		t.Fatalf("protected orphan reconcile: n=%d micro=%d err=%v", n, micro, err)
+	}
+	acc, err := db.GetWalletAccount(ctx, userID)
+	if err != nil || acc.AvailableMicro != 8*testYuan || acc.ReservedMicro != 2*testYuan {
+		t.Fatalf("protected balance: %+v err=%v", acc, err)
+	}
+
+	if err := db.PrepareWalletSettlement(ctx, userID, 2*testYuan, 1*testYuan, "request", refID); err != nil {
+		t.Fatalf("prepare settle: %v", err)
+	}
+	result, err := db.RetryWalletSettlementIntents(ctx, 100)
+	if err != nil || result.Settled != 1 || result.Released != 0 || result.Failed != 0 {
+		t.Fatalf("retry settle: %+v err=%v", result, err)
+	}
+	acc, err = db.GetWalletAccount(ctx, userID)
+	if err != nil || acc.AvailableMicro != 9*testYuan || acc.ReservedMicro != 0 {
+		t.Fatalf("settled balance: %+v err=%v", acc, err)
+	}
+
+	// 重跑不能重复扣款。
+	result, err = db.RetryWalletSettlementIntents(ctx, 100)
+	if err != nil || result != (WalletSettlementRetryResult{}) {
+		t.Fatalf("second retry: %+v err=%v", result, err)
+	}
+	acc, _ = db.GetWalletAccount(ctx, userID)
+	if acc.AvailableMicro != 9*testYuan || acc.ReservedMicro != 0 {
+		t.Fatalf("second retry mutated balance: %+v", acc)
+	}
+	var status string
+	if err := db.conn.QueryRowContext(ctx, `SELECT status FROM wallet_settlement_intents WHERE reference_type='request' AND reference_id=$1`, refID).Scan(&status); err != nil || status != WalletSettlementSettled {
+		t.Fatalf("intent status=%q err=%v", status, err)
+	}
+}
+
+func TestWalletSettlementIntentRetriesReleaseIdempotently(t *testing.T) {
+	db := newWalletTestDB(t)
+	ctx := context.Background()
+	const userID = 42
+	const refID = "release-pending"
+
+	if _, err := db.WalletCredit(ctx, userID, 10*testYuan, WalletTxRecharge, "order", "credit-42", "credit:42", 0, ""); err != nil {
+		t.Fatalf("credit: %v", err)
+	}
+	if _, err := db.WalletReserve(ctx, userID, 2*testYuan, "request", refID, "reserve:"+refID); err != nil {
+		t.Fatalf("reserve: %v", err)
+	}
+	if err := db.CreateWalletSettlementIntent(ctx, userID, 2*testYuan, "request", refID); err != nil {
+		t.Fatalf("create intent: %v", err)
+	}
+	if err := db.PrepareWalletRelease(ctx, userID, 2*testYuan, "request", refID); err != nil {
+		t.Fatalf("prepare release: %v", err)
+	}
+
+	result, err := db.RetryWalletSettlementIntents(ctx, 100)
+	if err != nil || result.Released != 1 || result.Settled != 0 || result.Failed != 0 {
+		t.Fatalf("retry release: %+v err=%v", result, err)
+	}
+	acc, err := db.GetWalletAccount(ctx, userID)
+	if err != nil || acc.AvailableMicro != 10*testYuan || acc.ReservedMicro != 0 {
+		t.Fatalf("released balance: %+v err=%v", acc, err)
+	}
+	result, err = db.RetryWalletSettlementIntents(ctx, 100)
+	if err != nil || result != (WalletSettlementRetryResult{}) {
+		t.Fatalf("second retry: %+v err=%v", result, err)
+	}
+	acc, _ = db.GetWalletAccount(ctx, userID)
+	if acc.AvailableMicro != 10*testYuan || acc.ReservedMicro != 0 {
+		t.Fatalf("second retry mutated balance: %+v", acc)
+	}
+}
+
 // TestRebuildWalletLedgerOldUniqueConstraint 校验旧版单列幂等键 UNIQUE 表能被迁移为
 // (user_id, idempotency_key) 复合唯一（SQLite 表重建路径）。
 func TestRebuildWalletLedgerOldUniqueConstraint(t *testing.T) {

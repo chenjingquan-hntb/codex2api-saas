@@ -4884,26 +4884,41 @@ func TestAuthMiddlewareRejectsQuotaExhaustedAPIKey(t *testing.T) {
 	}
 }
 
-func TestAuthMiddlewareUsesRuntimeAPIKeyCache(t *testing.T) {
+func TestAuthMiddlewareRuntimeAPIKeyCacheIsNotAuthoritative(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	key := "sk-test-runtime-cache-1234567890"
-	tc := cache.NewMemory(1)
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New: %v", err)
+	}
 	ctx := context.Background()
-	keyPayload, _ := json.Marshal(apiKeyRuntimeRecord{
+	key := "sk-test-runtime-cache-1234567890"
+	realID, err := db.InsertAPIKeyWithOptions(ctx, database.APIKeyInput{
+		Name:   "Database Team",
+		Key:    key,
+		UserID: 7,
+	})
+	if err != nil {
+		t.Fatalf("InsertAPIKeyWithOptions: %v", err)
+	}
+
+	tc := cache.NewMemory(1)
+	forgedPayload, _ := json.Marshal(apiKeyRuntimeRecord{
 		ID:        42,
-		Name:      "Cached Team",
+		Name:      "Forged Cache Team",
+		UserID:    999,
 		CreatedAt: time.Now(),
 	})
-	if err := tc.SetRuntime(ctx, apiKeyCacheNamespace, key, keyPayload, time.Minute); err != nil {
-		t.Fatalf("SetRuntime api key: %v", err)
+	if err := tc.SetRuntime(ctx, apiKeyCacheNamespace, database.HashAPIKeySecret(key), forgedPayload, time.Minute); err != nil {
+		t.Fatalf("SetRuntime real-key poison: %v", err)
 	}
 	countPayload, _ := json.Marshal(apiKeyCountRuntimeRecord{Count: 1})
 	if err := tc.SetRuntime(ctx, apiKeyCountCacheNamespace, "all", countPayload, time.Minute); err != nil {
 		t.Fatalf("SetRuntime api key count: %v", err)
 	}
 
-	handler := NewHandler(nil, nil, nil, nil)
+	handler := NewHandler(nil, db, nil, nil)
 	handler.SetRuntimeCache(tc)
 	router := gin.New()
 	router.Use(handler.authMiddleware())
@@ -4915,25 +4930,43 @@ func TestAuthMiddlewareUsesRuntimeAPIKeyCache(t *testing.T) {
 		})
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/ok", nil)
-	req.Header.Set("Authorization", "Bearer "+key)
-	recorder := httptest.NewRecorder()
+	request := func(presented string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/ok", nil)
+		req.Header.Set("Authorization", "Bearer "+presented)
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, req)
+		return recorder
+	}
 
-	router.ServeHTTP(recorder, req)
-
+	// 缓存中的伪造身份不能覆盖数据库权威元数据。
+	recorder := request(key)
 	if recorder.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
 	}
-	var payload struct {
-		ID   int64  `json:"id"`
-		Name string `json:"name"`
-		Raw  string `json:"raw"`
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "id").Int(); got != realID {
+		t.Fatalf("id = %d, want database id %d", got, realID)
 	}
-	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
-		t.Fatalf("json.Unmarshal 返回错误: %v", err)
+	if got := gjson.GetBytes(recorder.Body.Bytes(), "name").String(); got != "Database Team" {
+		t.Fatalf("name = %q, want database metadata", got)
 	}
-	if payload.ID != 42 || payload.Name != "Cached Team" || payload.Raw != key {
-		t.Fatalf("payload = %#v", payload)
+
+	// 数据库不存在的 key 即使缓存被投毒也必须返回 401。
+	forgedKey := "sk-forged-cache-only-1234567890"
+	if err := tc.SetRuntime(ctx, apiKeyCacheNamespace, database.HashAPIKeySecret(forgedKey), forgedPayload, time.Minute); err != nil {
+		t.Fatalf("SetRuntime forged key: %v", err)
+	}
+	recorder = request(forgedKey)
+	if recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("forged cache-only key status = %d, want %d, body=%s", recorder.Code, http.StatusUnauthorized, recorder.Body.String())
+	}
+
+	// 数据库不可用时即使缓存命中也必须 fail-closed 返回 503。
+	if err := db.Close(); err != nil {
+		t.Fatalf("close database: %v", err)
+	}
+	recorder = request(key)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("cache hit with database down status = %d, want %d, body=%s", recorder.Code, http.StatusServiceUnavailable, recorder.Body.String())
 	}
 }
 

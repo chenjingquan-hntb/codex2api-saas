@@ -342,6 +342,14 @@ func credentialStringMap(raw interface{}, key string) map[string]string {
 	if credentials == nil {
 		return nil
 	}
+	return credentialStringMapFromMap(credentials, key)
+}
+
+// credentialStringMapFromMap 从已解码的凭证 map 读取字符串映射字段。
+func credentialStringMapFromMap(credentials map[string]interface{}, key string) map[string]string {
+	if credentials == nil {
+		return nil
+	}
 	value, ok := credentials[key]
 	if !ok || value == nil {
 		return nil

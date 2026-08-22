@@ -380,6 +380,12 @@ func (db *DB) ReconcileOrphanedWalletReservations(ctx context.Context, olderThan
 			  AND l.reference_type = 'request'
 			  AND l.created_at < $1
 			  AND NOT EXISTS (
+				SELECT 1 FROM wallet_settlement_intents si
+				WHERE si.user_id = l.user_id
+				  AND si.reference_type = l.reference_type
+				  AND si.reference_id = l.reference_id
+			  )
+			  AND NOT EXISTS (
 				SELECT 1 FROM wallet_ledger_entries p
 				WHERE p.type IN ('release', 'consume')
 				  AND (
@@ -470,16 +476,16 @@ func decodeTimeValue(raw interface{}) time.Time {
 
 // PaymentSummary 是管理员对账看板的聚合指标。
 type PaymentSummary struct {
-	TodayPaidCount    int64            `json:"today_paid_count"`    // 今日（UTC 日界）已入账订单数
-	TodayPaidMicro    int64            `json:"today_paid_micro"`    // 今日已入账金额（微元）
-	WeekPaidMicro     int64            `json:"week_paid_micro"`     // 近 7 日已入账金额
-	TotalPaidMicro    int64            `json:"total_paid_micro"`    // 累计已入账金额
-	StatusCounts      map[string]int64 `json:"status_counts"`       // 各状态订单数
-	PendingExpiring   int64            `json:"pending_expiring"`    // pending 且 1 小时内过期（待跟进）
-	RefundedCount     int64            `json:"refunded_count"`      // 退款订单数
-	RefundedMicro     int64            `json:"refunded_micro"`      // 退款总额（微元，正值）
-	AdjustmentCount   int64            `json:"adjustment_count"`    // 余额调整次数
-	LedgerEntryCount  int64            `json:"ledger_entry_count"`  // 账本总条数
+	TodayPaidCount   int64            `json:"today_paid_count"`   // 今日（UTC 日界）已入账订单数
+	TodayPaidMicro   int64            `json:"today_paid_micro"`   // 今日已入账金额（微元）
+	WeekPaidMicro    int64            `json:"week_paid_micro"`    // 近 7 日已入账金额
+	TotalPaidMicro   int64            `json:"total_paid_micro"`   // 累计已入账金额
+	StatusCounts     map[string]int64 `json:"status_counts"`      // 各状态订单数
+	PendingExpiring  int64            `json:"pending_expiring"`   // pending 且 1 小时内过期（待跟进）
+	RefundedCount    int64            `json:"refunded_count"`     // 退款订单数
+	RefundedMicro    int64            `json:"refunded_micro"`     // 退款总额（微元，正值）
+	AdjustmentCount  int64            `json:"adjustment_count"`   // 余额调整次数
+	LedgerEntryCount int64            `json:"ledger_entry_count"` // 账本总条数
 }
 
 // GetPaymentSummary 汇总充值/退款/调整的对账指标。
@@ -573,6 +579,8 @@ type BalanceDrift struct {
 	Email         string `json:"email"`
 	ExpectedMicro int64  `json:"expected_micro"` // 账本流水重算值
 	ActualMicro   int64  `json:"actual_micro"`   // wallet_accounts 当前值
+	ReservedMicro int64  `json:"reserved_micro"` // 修复前 reserved 快照
+	Version       int64  `json:"version"`        // 修复前版本快照
 	DiffMicro     int64  `json:"diff_micro"`     // expected - actual（>0 表示少记/被多扣）
 }
 
@@ -582,11 +590,12 @@ type BalanceDrift struct {
 func (db *DB) ReconcileWalletBalances(ctx context.Context) ([]BalanceDrift, error) {
 	rows, err := db.conn.QueryContext(ctx, `
 		SELECT wa.user_id, COALESCE(wa.available_micro, 0),
-		       COALESCE(SUM(l.amount_micro), 0), COALESCE(u.email, '')
+               COALESCE(wa.reserved_micro, 0), COALESCE(wa.version, 0),
+               COALESCE(SUM(l.amount_micro), 0), COALESCE(u.email, '')
 		FROM wallet_accounts wa
 		LEFT JOIN wallet_ledger_entries l ON l.user_id = wa.user_id
 		LEFT JOIN users u ON u.id = wa.user_id
-		GROUP BY wa.user_id, wa.available_micro, u.email
+		GROUP BY wa.user_id, wa.available_micro, wa.reserved_micro, wa.version, u.email
 		ORDER BY wa.user_id`)
 	if err != nil {
 		return nil, fmt.Errorf("wallet: reconcile: %w", err)
@@ -595,7 +604,7 @@ func (db *DB) ReconcileWalletBalances(ctx context.Context) ([]BalanceDrift, erro
 	var drifts []BalanceDrift
 	for rows.Next() {
 		var d BalanceDrift
-		if err := rows.Scan(&d.UserID, &d.ActualMicro, &d.ExpectedMicro, &d.Email); err != nil {
+		if err := rows.Scan(&d.UserID, &d.ActualMicro, &d.ReservedMicro, &d.Version, &d.ExpectedMicro, &d.Email); err != nil {
 			return nil, err
 		}
 		d.DiffMicro = d.ExpectedMicro - d.ActualMicro
@@ -607,6 +616,27 @@ func (db *DB) ReconcileWalletBalances(ctx context.Context) ([]BalanceDrift, erro
 		return nil, err
 	}
 	return drifts, nil
+}
+
+// FixWalletBalanceIfUnchanged 仅在对账快照仍然有效时修复余额。
+// 账本是权威，但不能用旧快照覆盖并发中的正常充值/扣费；version、available、reserved
+// 三重条件保证修复与财务写入不会互相踩踏。返回 false 表示快照已过期。
+func (db *DB) FixWalletBalanceIfUnchanged(ctx context.Context, drift BalanceDrift) (bool, error) {
+	if drift.UserID <= 0 {
+		return false, fmt.Errorf("wallet: fix balance: invalid user")
+	}
+	if drift.ExpectedMicro < 0 {
+		return false, fmt.Errorf("wallet: fix balance: expected must be non-negative, got %d", drift.ExpectedMicro)
+	}
+	res, err := db.conn.ExecContext(ctx, `UPDATE wallet_accounts SET available_micro = $1, version = version + 1, updated_at = $2 WHERE user_id = $3 AND available_micro = $4 AND reserved_micro = $5 AND version = $6`, drift.ExpectedMicro, db.timeArg(time.Now().UTC()), drift.UserID, drift.ActualMicro, drift.ReservedMicro, drift.Version)
+	if err != nil {
+		return false, fmt.Errorf("wallet: fix balance: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // FixWalletBalance 把指定钱包账户的 available 修复为账本重算值（管理员操作）。

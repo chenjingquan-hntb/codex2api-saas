@@ -39,6 +39,10 @@ const (
 
 	epayChannelAlipay = "alipay"
 	epayChannelWxpay  = "wxpay"
+
+	// 只对失败回调按来源 IP 计数，避免合法支付高峰误伤。
+	epayCallbackFailureLimit  = 30
+	epayCallbackFailureWindow = 5 * time.Minute
 )
 
 // ==================== 易支付签名 ====================
@@ -211,13 +215,13 @@ func (h *Handler) CreateEpayRechargeOrder(c *gin.Context) {
 			sess.UserID, order.OrderNo, order.AmountMicro, channel))
 
 	c.JSON(http.StatusOK, gin.H{
-		"order_no":      order.OrderNo,
-		"channel":       channel,
-		"amount_micro":  order.AmountMicro,
-		"status":        order.Status,
-		"expires_at":    expiresAt.UTC().Format(time.RFC3339),
-		"gateway_url":   strings.TrimSpace(cfg.GatewayURL),
-		"form":          params,
+		"order_no":     order.OrderNo,
+		"channel":      channel,
+		"amount_micro": order.AmountMicro,
+		"status":       order.Status,
+		"expires_at":   expiresAt.UTC().Format(time.RFC3339),
+		"gateway_url":  strings.TrimSpace(cfg.GatewayURL),
+		"form":         params,
 	})
 }
 
@@ -240,7 +244,7 @@ func (h *Handler) GetMyWallet(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"currency":       acc.Currency,
+		"currency":        acc.Currency,
 		"available_micro": acc.AvailableMicro,
 		"reserved_micro":  acc.ReservedMicro,
 	})
@@ -321,6 +325,14 @@ func rechargeOrderJSON(o database.RechargeOrder) gin.H {
 // 网关回调：验签 → 校验商户号/订单/金额 → 幂等入账。
 // 成功回复纯文本 "success"；任何失败回复非 success 让网关重试。
 func (h *Handler) EpayNotify(c *gin.Context) {
+	ip := c.ClientIP()
+	if h != nil && h.epayCallbackFailureLimiter != nil && h.epayCallbackFailureLimiter.blocked(ip, time.Now()) {
+		h.epayRateLimitedCount.Add(1)
+		security.SecurityAuditLog("WALLET_EPAY_CALLBACK_RATE_LIMITED", "ip="+security.SanitizeLog(ip))
+		c.String(http.StatusTooManyRequests, "fail")
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
 
@@ -333,20 +345,33 @@ func (h *Handler) EpayNotify(c *gin.Context) {
 
 	params := formParams(c)
 	if !epayVerifySign(params, cfg.Key) {
+		h.recordEpayCallbackFailure(ip, true)
 		security.SecurityAuditLog("WALLET_EPAY_CALLBACK_BAD_SIGN",
 			fmt.Sprintf("order_no=%s pid=%s", params["out_trade_no"], params["pid"]))
 		c.String(http.StatusBadRequest, "fail")
 		return
 	}
 	if strings.TrimSpace(params["pid"]) != strings.TrimSpace(cfg.MerchantID) {
+		h.recordEpayCallbackFailure(ip, false)
 		security.SecurityAuditLog("WALLET_EPAY_CALLBACK_BAD_MERCHANT",
 			fmt.Sprintf("order_no=%s pid=%s", params["out_trade_no"], params["pid"]))
 		c.String(http.StatusBadRequest, "fail")
 		return
 	}
+	tradeStatus := strings.ToUpper(strings.TrimSpace(params["trade_status"]))
+	if tradeStatus != "TRADE_SUCCESS" {
+		h.epayRejectedCount.Add(1)
+		// 合法签名只证明消息来自网关，不代表交易已经支付成功。对 pending、
+		// failed 或缺失状态统一确认接收但不入账，避免网关重试风暴。
+		security.SecurityAuditLog("WALLET_EPAY_CALLBACK_NON_SUCCESS",
+			fmt.Sprintf("order_no=%s trade_status=%s", params["out_trade_no"], tradeStatus))
+		c.String(http.StatusOK, "success")
+		return
+	}
 	orderNo := strings.TrimSpace(params["out_trade_no"])
 	amount, err := database.ParseYuanToMicro(params["money"])
 	if err != nil {
+		h.recordEpayCallbackFailure(ip, false)
 		security.SecurityAuditLog("WALLET_EPAY_CALLBACK_BAD_MONEY",
 			fmt.Sprintf("order_no=%s money=%q", orderNo, params["money"]))
 		c.String(http.StatusBadRequest, "fail")
@@ -360,10 +385,12 @@ func (h *Handler) EpayNotify(c *gin.Context) {
 			fmt.Sprintf("order_no=%s amount_micro=%d replayed=%v", orderNo, amount, replayed))
 		c.String(http.StatusOK, "success")
 	case errors.Is(err, database.ErrEpayOrderNotFound):
+		h.recordEpayCallbackFailure(ip, false)
 		security.SecurityAuditLog("WALLET_EPAY_CALLBACK_ORDER_NOT_FOUND",
 			fmt.Sprintf("order_no=%s amount_micro=%d", orderNo, amount))
 		c.String(http.StatusNotFound, "fail")
 	case errors.Is(err, database.ErrEpayAmountMismatch):
+		h.recordEpayCallbackFailure(ip, false)
 		security.SecurityAuditLog("WALLET_EPAY_CALLBACK_AMOUNT_MISMATCH",
 			fmt.Sprintf("order_no=%s callback_micro=%d", orderNo, amount))
 		c.String(http.StatusBadRequest, "fail")
@@ -373,6 +400,19 @@ func (h *Handler) EpayNotify(c *gin.Context) {
 	default:
 		log.Printf("epay: notify credit failed order_no=%s: %v", orderNo, err)
 		c.String(http.StatusInternalServerError, "fail")
+	}
+}
+
+func (h *Handler) recordEpayCallbackFailure(ip string, badSign bool) {
+	if h == nil {
+		return
+	}
+	h.epayRejectedCount.Add(1)
+	if badSign {
+		h.epayBadSignCount.Add(1)
+	}
+	if h.epayCallbackFailureLimiter != nil {
+		_ = h.epayCallbackFailureLimiter.allow(ip, time.Now())
 	}
 }
 

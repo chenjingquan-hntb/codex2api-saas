@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -239,7 +240,7 @@ func (h *Handler) EndpointOverview(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"endpoint":         ep,
+		"endpoint":          ep,
 		"allowed_group_ids": groups,
 		"visible_accounts":  len(accounts),
 		"wallet_write":      proxyWalletWriteMode(),
@@ -349,13 +350,101 @@ func (h *Handler) adminEndpointStatusOp(c *gin.Context, status, auditEvent strin
 
 // healthzResponse 是 /healthz 响应；dependencies 供监控消费。
 type healthzResponse struct {
-	Status       string                  `json:"status"` // ok / draining / degraded / down
-	EndpointID   string                  `json:"endpoint_id,omitempty"`
-	Version      string                  `json:"version,omitempty"`
-	UptimeSec    int64                   `json:"uptime_seconds"`
-	WalletWrite  string                  `json:"wallet_write,omitempty"` // shared / primary / readonly（P7.6）
-	Dependencies map[string]string       `json:"dependencies"`
-	Details      map[string]string       `json:"details,omitempty"`
+	Status       string            `json:"status"` // ok / draining / degraded / down
+	EndpointID   string            `json:"endpoint_id,omitempty"`
+	Version      string            `json:"version,omitempty"`
+	UptimeSec    int64             `json:"uptime_seconds"`
+	WalletWrite  string            `json:"wallet_write,omitempty"` // shared / primary / readonly（P7.6）
+	Dependencies map[string]string `json:"dependencies"`
+	Financial    *healthzFinancial `json:"financial,omitempty"`
+	Details      map[string]string `json:"details,omitempty"`
+}
+
+type healthzFinancial struct {
+	WalletBalanceDrifts int64 `json:"wallet_balance_drifts"`
+	SettlementInFlight  int64 `json:"settlement_in_flight"`
+	SettlementPending   int64 `json:"settlement_pending"`
+	SettlementRetried   int64 `json:"settlement_retried"`
+	StaleInFlight       int64 `json:"stale_in_flight"`
+	EpayBadSign         int64 `json:"epay_bad_sign"`
+	EpayRejected        int64 `json:"epay_rejected"`
+	EpayRateLimited     int64 `json:"epay_rate_limited"`
+}
+
+type financialHealthDBSnapshot struct {
+	WalletBalanceDrifts int64
+	SettlementInFlight  int64
+	SettlementPending   int64
+	SettlementRetried   int64
+	StaleInFlight       int64
+	Err                 string
+}
+
+const financialHealthCacheTTL = time.Minute
+
+// financialHealthSnapshot 对可能扫描账本的指标做 1 分钟进程内缓存，避免公网
+// /healthz 高频探测把财务对账查询放大成数据库压力。
+func (h *Handler) financialHealthSnapshot(ctx context.Context) (healthzFinancial, string) {
+	result := healthzFinancial{}
+	if h == nil {
+		return result, ""
+	}
+	result.EpayBadSign = h.epayBadSignCount.Load()
+	result.EpayRejected = h.epayRejectedCount.Load()
+	result.EpayRateLimited = h.epayRateLimitedCount.Load()
+	if h.db == nil {
+		return result, "database unavailable"
+	}
+
+	h.financialHealthMu.Lock()
+	defer h.financialHealthMu.Unlock()
+	if h.financialHealthAt.IsZero() || time.Since(h.financialHealthAt) >= financialHealthCacheTTL {
+		snapshot := financialHealthDBSnapshot{}
+		drifts, err := h.db.ReconcileWalletBalances(ctx)
+		if err != nil {
+			snapshot.Err = err.Error()
+		} else {
+			snapshot.WalletBalanceDrifts = int64(len(drifts))
+			metrics, metricErr := h.db.GetWalletSettlementMetrics(ctx, 24*time.Hour)
+			if metricErr != nil {
+				snapshot.Err = metricErr.Error()
+			} else {
+				snapshot.SettlementInFlight = metrics.InFlight
+				snapshot.SettlementPending = metrics.SettlePending + metrics.ReleasePending
+				snapshot.SettlementRetried = metrics.Retried
+				snapshot.StaleInFlight = metrics.StaleInFlight
+			}
+		}
+		h.financialHealthDB = snapshot
+		h.financialHealthAt = time.Now()
+	}
+	result.WalletBalanceDrifts = h.financialHealthDB.WalletBalanceDrifts
+	result.SettlementInFlight = h.financialHealthDB.SettlementInFlight
+	result.SettlementPending = h.financialHealthDB.SettlementPending
+	result.SettlementRetried = h.financialHealthDB.SettlementRetried
+	result.StaleInFlight = h.financialHealthDB.StaleInFlight
+	return result, h.financialHealthDB.Err
+}
+
+// credentialsEncryptionHealthSnapshot 以一分钟缓存检查明文凭证残留，避免公网
+// /healthz 高频探测反复扫描 accounts；同时能发现旧版本实例/外部写入者重新写入明文。
+func (h *Handler) credentialsEncryptionHealthSnapshot(ctx context.Context) (int64, string) {
+	if h == nil || h.db == nil {
+		return 0, "database unavailable"
+	}
+	h.credentialsHealthMu.Lock()
+	defer h.credentialsHealthMu.Unlock()
+	if h.credentialsHealthAt.IsZero() || time.Since(h.credentialsHealthAt) >= financialHealthCacheTTL {
+		count, err := h.db.CountPlaintextCredentials(ctx)
+		h.credentialsPlaintextRows = count
+		if err != nil {
+			h.credentialsHealthErr = err.Error()
+		} else {
+			h.credentialsHealthErr = ""
+		}
+		h.credentialsHealthAt = time.Now()
+	}
+	return h.credentialsPlaintextRows, h.credentialsHealthErr
 }
 
 // proxyWalletWriteMode 汇总钱包写模式供 /healthz 展示：
@@ -399,6 +488,42 @@ func (h *Handler) GetHealthz(c *gin.Context) {
 	}
 	resp.Dependencies["postgres"] = map[bool]string{true: "ok", false: "down"}[pgOK]
 
+	financialStatus := "down"
+	if pgOK {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		financial, financialErr := h.financialHealthSnapshot(ctx)
+		cancel()
+		resp.Financial = &financial
+		if financialErr != "" {
+			financialStatus = "degraded"
+			resp.Details["financial_error"] = financialErr
+		} else if financial.WalletBalanceDrifts > 0 || financial.SettlementPending > 0 || financial.StaleInFlight > 0 {
+			financialStatus = "degraded"
+		} else {
+			financialStatus = "ok"
+		}
+	}
+	resp.Dependencies["financial"] = financialStatus
+
+	// 账号凭证加密状态（B0 整改）：不仅检查是否配置密钥，还缓存核对数据库是否
+	// 存在明文残留；发现残留或检查失败时标记 degraded。
+	credentialsStatus := "plaintext"
+	if h != nil && h.db != nil && h.db.CredentialsEncryptionEnabled() {
+		credentialsStatus = "ok"
+		resp.Details["credentials_encryption_version"] = strconv.Itoa(h.db.CredentialsEncryptionVersion())
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		plaintextRows, credentialsErr := h.credentialsEncryptionHealthSnapshot(ctx)
+		cancel()
+		resp.Details["credentials_plaintext_rows"] = strconv.FormatInt(plaintextRows, 10)
+		if credentialsErr != "" {
+			credentialsStatus = "degraded"
+			resp.Details["credentials_encryption_error"] = credentialsErr
+		} else if plaintextRows > 0 {
+			credentialsStatus = "plaintext_remaining"
+		}
+	}
+	resp.Dependencies["credentials_encryption"] = credentialsStatus
+
 	// Redis 依赖（可选：未配置为 disabled）。
 	redisStatus := "disabled"
 	if h != nil && h.cache != nil && h.cache.Driver() == "redis" {
@@ -431,9 +556,11 @@ func (h *Handler) GetHealthz(c *gin.Context) {
 	case drain:
 		resp.Status = "draining"
 		c.JSON(http.StatusOK, resp)
-	case redisStatus == "down":
+	case redisStatus == "down" || financialStatus == "degraded" || credentialsStatus == "degraded" || credentialsStatus == "plaintext_remaining":
 		resp.Status = "degraded"
-		resp.Details["note"] = "redis unavailable; fail-closed billing still enforced"
+		if redisStatus == "down" {
+			resp.Details["note"] = "redis unavailable; fail-closed billing still enforced"
+		}
 		c.JSON(http.StatusOK, resp)
 	default:
 		resp.Status = "ok"

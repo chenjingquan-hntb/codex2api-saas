@@ -3,7 +3,7 @@ package database
 import (
 	"context"
 	"errors"
-	
+
 	"testing"
 	"time"
 )
@@ -304,9 +304,38 @@ func TestReconcileWalletBalances(t *testing.T) {
 	if len(drifts) != 1 || drifts[0].UserID != userID || drifts[0].DiffMicro != 30 {
 		t.Fatalf("drifts = %+v", drifts)
 	}
-	// 修复后一致。
-	if err := db.FixWalletBalance(ctx, userID, drifts[0].ExpectedMicro); err != nil {
-		t.Fatalf("fix: %v", err)
+	stale := drifts[0]
+
+	// 快照生成后发生正常充值，version 必须变化；旧快照不得覆盖新资金操作。
+	const concurrentCredit = 10 * testFen
+	if _, err := db.WalletCredit(ctx, userID, concurrentCredit, WalletTxAdjustment,
+		"admin_adjust", "REC-CONCURRENT", "adjust:REC-CONCURRENT", 1, "concurrent credit"); err != nil {
+		t.Fatalf("concurrent credit: %v", err)
+	}
+	fixed, err := db.FixWalletBalanceIfUnchanged(ctx, stale)
+	if err != nil {
+		t.Fatalf("stale fix: %v", err)
+	}
+	if fixed {
+		t.Fatal("stale reconciliation snapshot overwrote concurrent wallet write")
+	}
+	acc, err := db.GetWalletAccount(ctx, userID)
+	if err != nil {
+		t.Fatalf("get wallet after conflict: %v", err)
+	}
+	wantAfterCredit := amount - 30 + concurrentCredit
+	if acc.AvailableMicro != wantAfterCredit {
+		t.Fatalf("concurrent credit lost: available=%d want=%d", acc.AvailableMicro, wantAfterCredit)
+	}
+
+	// 重新读取快照后可条件修复，并恢复到账本权威值。
+	drifts, err = db.ReconcileWalletBalances(ctx)
+	if err != nil || len(drifts) != 1 {
+		t.Fatalf("fresh reconcile: drifts=%+v err=%v", drifts, err)
+	}
+	fixed, err = db.FixWalletBalanceIfUnchanged(ctx, drifts[0])
+	if err != nil || !fixed {
+		t.Fatalf("fresh fix: fixed=%v err=%v", fixed, err)
 	}
 	drifts, err = db.ReconcileWalletBalances(ctx)
 	if err != nil {
@@ -315,12 +344,12 @@ func TestReconcileWalletBalances(t *testing.T) {
 	if len(drifts) != 0 {
 		t.Fatalf("drifts after fix = %+v", drifts)
 	}
-	// 修复不存在用户报错。
-	if err := db.FixWalletBalance(ctx, 99999, 0); err == nil {
-		t.Fatal("fix missing account accepted")
+
+	// 不存在账户返回冲突/未修复，负数期望值拒绝。
+	if fixed, err := db.FixWalletBalanceIfUnchanged(ctx, BalanceDrift{UserID: 99999}); err != nil || fixed {
+		t.Fatalf("missing account fix: fixed=%v err=%v", fixed, err)
 	}
-	// 负数期望值拒绝。
-	if err := db.FixWalletBalance(ctx, userID, -1); err == nil {
+	if _, err := db.FixWalletBalanceIfUnchanged(ctx, BalanceDrift{UserID: userID, ExpectedMicro: -1}); err == nil {
 		t.Fatal("negative expected accepted")
 	}
 }

@@ -170,7 +170,7 @@ func TestGetUserUsageReportAndDaily(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	now := time.Now().UTC()
+	now := StartOfDay(time.Now()).Add(6 * time.Hour)
 	// 插入两条该用户的用量 + 一条他人 key 的用量（不应被聚合）。
 	insertUsage := func(apiKeyID int64, model string, tokens int64, billed float64, at time.Time, status int) {
 		t.Helper()

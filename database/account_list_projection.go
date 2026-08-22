@@ -10,37 +10,33 @@ import (
 
 // ListAccountListProjection returns only non-secret fields needed to build the
 // short-lived admin list snapshot. In particular it never selects or decodes
-// the complete credentials document.
+// the complete credentials document: all display/index attributes come from the
+// dedicated projection columns (kept in sync by every credentials write and by
+// the startup backfill), so the encrypted credentials blob is never parsed in
+// this path.
 func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]*AccountRow, error) {
 	channel = strings.ToLower(strings.TrimSpace(channel))
 	where := `status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
-	upstreamExpr := `LOWER(COALESCE(credentials->>'upstream_type', ''))`
-	fromClause := `FROM accounts
-		CROSS JOIN LATERAL jsonb_to_record(accounts.credentials) AS account_public(
-			upstream_type text, email text, base_url text, plan_type text,
-			models jsonb, api_key text, refresh_token text, scheduler_priority text
-		)`
+	upstreamExpr := `LOWER(COALESCE(upstream_type, ''))`
 	credentialColumns := `
-		COALESCE(account_public.upstream_type, ''),
-		COALESCE(account_public.email, ''),
-		COALESCE(account_public.base_url, ''),
-		COALESCE(account_public.plan_type, ''),
-		COALESCE(account_public.models, '[]'::jsonb)::text,
-		COALESCE(account_public.api_key, '') <> '',
-		COALESCE(account_public.refresh_token, '') <> '',
-		COALESCE(account_public.scheduler_priority, '')`
+		COALESCE(upstream_type, ''),
+		COALESCE(email, ''),
+		COALESCE(base_url, ''),
+		COALESCE(plan_type, ''),
+		COALESCE(cred_models, '[]'),
+		COALESCE(has_api_key, false),
+		COALESCE(has_refresh_token, false),
+		COALESCE(scheduler_priority, '')`
 	if db.isSQLite() {
-		upstreamExpr = `LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), ''))`
-		fromClause = `FROM accounts`
 		credentialColumns = `
-			COALESCE(json_extract(credentials, '$.upstream_type'), ''),
-			COALESCE(json_extract(credentials, '$.email'), ''),
-			COALESCE(json_extract(credentials, '$.base_url'), ''),
-			COALESCE(json_extract(credentials, '$.plan_type'), ''),
-			COALESCE(json_extract(credentials, '$.models'), '[]'),
-			CASE WHEN COALESCE(json_extract(credentials, '$.api_key'), '') <> '' THEN 1 ELSE 0 END,
-			CASE WHEN COALESCE(json_extract(credentials, '$.refresh_token'), '') <> '' THEN 1 ELSE 0 END,
-			COALESCE(CAST(json_extract(credentials, '$.scheduler_priority') AS TEXT), '')`
+			COALESCE(upstream_type, ''),
+			COALESCE(email, ''),
+			COALESCE(base_url, ''),
+			COALESCE(plan_type, ''),
+			COALESCE(cred_models, '[]'),
+			COALESCE(has_api_key, 0),
+			COALESCE(has_refresh_token, 0),
+			COALESCE(scheduler_priority, '')`
 	}
 	switch channel {
 	case UpstreamChannelGrok:
@@ -54,7 +50,7 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 		COALESCE(error_message, ''), COALESCE(enabled, true), COALESCE(locked, false),
 		score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), created_at, updated_at,
 		COALESCE(credential_generation, 1), COALESCE(credential_family_id, ''),` + credentialColumns + `
-		` + fromClause + ` WHERE ` + where + ` ORDER BY id`
+		FROM accounts WHERE ` + where + ` ORDER BY id`
 	rows, err := db.conn.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("查询账号列表投影失败: %w", err)
@@ -80,13 +76,13 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 	var cooldownRaw, tagsRaw, createdRaw, updatedRaw interface{}
 	var upstreamType, email, baseURL, planType, schedulerPriority string
 	var modelsRaw interface{}
-	var hasAPIKey, hasRefreshToken bool
+	var hasAPIKeyRaw, hasRefreshTokenRaw interface{}
 	if err := scanner.Scan(
 		&row.ID, &row.Name, &row.Type, &row.ProxyURL, &row.Status, &row.CooldownReason, &cooldownRaw,
 		&row.ErrorMessage, &row.Enabled, &row.Locked, &row.ScoreBiasOverride, &row.BaseConcurrencyOverride,
 		&tagsRaw, &createdRaw, &updatedRaw, &row.CredentialGeneration, &row.CredentialFamilyID,
 		&upstreamType, &email, &baseURL, &planType, &modelsRaw,
-		&hasAPIKey, &hasRefreshToken, &schedulerPriority,
+		&hasAPIKeyRaw, &hasRefreshTokenRaw, &schedulerPriority,
 	); err != nil {
 		return nil, fmt.Errorf("扫描账号列表投影失败: %w", err)
 	}
@@ -118,13 +114,37 @@ func scanAccountListProjection(scanner accountProjectionScanner) (*AccountRow, e
 	if models := decodeProjectionStringSlice(modelsRaw); len(models) > 0 {
 		row.Credentials["models"] = models
 	}
-	if hasAPIKey {
+	if projectionBoolValue(hasAPIKeyRaw) {
 		row.Credentials["api_key"] = "configured"
 	}
-	if hasRefreshToken {
+	if projectionBoolValue(hasRefreshTokenRaw) {
 		row.Credentials["refresh_token"] = "configured"
 	}
 	return row, nil
+}
+
+// projectionBoolValue 兼容 PostgreSQL BOOLEAN 与 SQLite 0/1 整数。
+func projectionBoolValue(value interface{}) bool {
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case int64:
+		return typed != 0
+	case int:
+		return typed != 0
+	case float64:
+		return typed != 0
+	case []byte:
+		return strings.TrimSpace(string(typed)) != "" && strings.TrimSpace(string(typed)) != "0" && !strings.EqualFold(strings.TrimSpace(string(typed)), "false")
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" || trimmed == "0" || strings.EqualFold(trimmed, "false") {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
 }
 
 func decodeProjectionStringSlice(value interface{}) []string {
@@ -148,6 +168,8 @@ func decodeProjectionStringSlice(value interface{}) []string {
 
 // ListActiveByIDs fetches the complete base rows for one selected page in a
 // single query. It is intentionally capped by the caller's page size (<=500).
+// The credentials blob is read through the encryption-aware expression and
+// decoded with db.decodeStoredCredentials.
 func (db *DB) ListActiveByIDs(ctx context.Context, ids []int64) ([]*AccountRow, error) {
 	ids = positiveUniqueIDs(ids)
 	if len(ids) == 0 {
@@ -159,7 +181,7 @@ func (db *DB) ListActiveByIDs(ctx context.Context, ids []int64) ([]*AccountRow, 
 		args = append(args, id)
 		placeholders = append(placeholders, fmt.Sprintf("$%d", len(args)))
 	}
-	query := `SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason,
+	query := `SELECT id, name, platform, type, ` + storedCredentialsExpr() + `, proxy_url, status, cooldown_reason,
 		cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false),
 		COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false),
 		COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override,
@@ -185,7 +207,7 @@ func (db *DB) ListActiveByIDs(ctx context.Context, ids []int64) ([]*AccountRow, 
 		); err != nil {
 			return nil, fmt.Errorf("扫描账号行失败: %w", err)
 		}
-		row.Credentials = decodeCredentials(credentialsRaw)
+		row.Credentials = db.decodeStoredCredentials(credentialsRaw)
 		row.Tags = decodeTagsValue(tagsRaw)
 		row.CooldownUntil, err = parseDBNullTimeValue(cooldownRaw)
 		if err != nil {
