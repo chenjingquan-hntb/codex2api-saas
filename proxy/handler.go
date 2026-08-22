@@ -61,6 +61,7 @@ type Handler struct {
 	scopeUsageMu sync.Mutex
 	scopeUsage   *apiKeyScopeUsageTracker
 	liveStore    *liveCallStore
+	walletCfg    walletBillingConfigCache // 数据面钱包计费配置缓存（TTL 刷新）
 }
 
 const (
@@ -73,6 +74,7 @@ const (
 type apiKeyRuntimeRecord struct {
 	ID        int64     `json:"id"`
 	Name      string    `json:"name"`
+	UserID    int64     `json:"user_id"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -1086,6 +1088,7 @@ func (h *Handler) resolveAPIKeyFromRuntimeCache(key string) (*database.APIKeyRow
 	return &database.APIKeyRow{
 		ID:        record.ID,
 		Name:      record.Name,
+		UserID:    record.UserID,
 		Key:       key,
 		CreatedAt: record.CreatedAt,
 	}, true
@@ -1101,6 +1104,7 @@ func (h *Handler) setAPIKeyRuntimeCache(row *database.APIKeyRow) {
 	record := apiKeyRuntimeRecord{
 		ID:        row.ID,
 		Name:      row.Name,
+		UserID:    row.UserID,
 		CreatedAt: row.CreatedAt,
 	}
 	payload, err := json.Marshal(record)
@@ -1256,6 +1260,7 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	populateCompactUsageMetaFromRequest(c, input)
 	markCyberPolicyUsageKind(input)
 	h.logUsage(input)
+	h.accumulateWalletCharge(c, input)
 }
 
 // logContinueThinkingRounds 为思考截断续想中「被折叠隐藏」的上游轮次补记真实用量。
@@ -2496,6 +2501,9 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 		if h.enforceRequiredNewAPIIdentityAtIngress(c) {
 			c.Abort()
 			return
+		}
+		if h.walletBeginBilling(c, apiKeyRow) {
+			defer h.finalizeWalletRequest(c)
 		}
 		c.Next()
 	}

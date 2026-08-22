@@ -40,6 +40,9 @@ const (
 	// Resource errors
 	ErrCodeResourceNotFound ErrorCode = "resource_not_found"
 	ErrCodeResourceConflict ErrorCode = "resource_conflict"
+
+	// Wallet / billing errors
+	ErrCodeInsufficientBalance ErrorCode = "insufficient_balance"
 )
 
 // ErrorType represents the category of error
@@ -104,6 +107,7 @@ var (
 	// Authentication errors
 	ErrMissingAPIKey = NewAPIError(ErrCodeMissingAPIKey, "Missing Authorization header", ErrorTypeAuthentication)
 	ErrInvalidAPIKey = NewAPIError(ErrCodeInvalidAPIKey, "Invalid API key provided", ErrorTypeAuthentication)
+	ErrInsufficientBalance = NewAPIError(ErrCodeInsufficientBalance, "Insufficient wallet balance; please recharge", ErrorTypePermission)
 
 	// Request validation errors
 	ErrInvalidRequest = NewAPIError(ErrCodeInvalidRequest, "Invalid request", ErrorTypeInvalidRequest)
@@ -134,6 +138,8 @@ func HTTPStatusCode(code ErrorCode) int {
 		return http.StatusBadRequest
 	case ErrCodeServiceUnavailable:
 		return http.StatusServiceUnavailable
+	case ErrCodeInsufficientBalance:
+		return http.StatusPaymentRequired
 	case ErrCodeServerError, ErrCodeUpstreamError, ErrCodeUpstreamTimeout:
 		return http.StatusInternalServerError
 	default:

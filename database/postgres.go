@@ -1833,6 +1833,7 @@ func (l APIKeyLimits) IsZero() bool {
 type APIKeyInput struct {
 	Name            string
 	Key             string
+	UserID          int64
 	QuotaLimit      float64
 	QuotaUsed       float64
 	ExpiresAt       sql.NullTime
@@ -1910,9 +1911,9 @@ func (db *DB) InsertAPIKeyWithOptions(ctx context.Context, input APIKeyInput) (i
 		input.QuotaUsed = 0
 	}
 	return db.insertRowID(ctx,
-		`INSERT INTO api_keys (name, key, quota_limit, quota_used, expires_at, allowed_group_ids, limits) VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb) RETURNING id`,
-		`INSERT INTO api_keys (name, key, quota_limit, quota_used, expires_at, allowed_group_ids, limits) VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		input.Name, input.Key, input.QuotaLimit, input.QuotaUsed, nullableTimeArg(input.ExpiresAt), encodeInt64SliceJSON(input.AllowedGroupIDs), encodeAPIKeyLimits(input.Limits),
+		`INSERT INTO api_keys (name, key, user_id, quota_limit, quota_used, expires_at, allowed_group_ids, limits) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb) RETURNING id`,
+		`INSERT INTO api_keys (name, key, user_id, quota_limit, quota_used, expires_at, allowed_group_ids, limits) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+		input.Name, input.Key, input.UserID, input.QuotaLimit, input.QuotaUsed, nullableTimeArg(input.ExpiresAt), encodeInt64SliceJSON(input.AllowedGroupIDs), encodeAPIKeyLimits(input.Limits),
 	)
 }
 
