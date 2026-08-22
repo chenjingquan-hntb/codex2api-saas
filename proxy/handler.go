@@ -353,15 +353,28 @@ func (h *Handler) applyUpstreamChannelFilter(c *gin.Context, effectiveModel stri
 	switch requestUpstreamChannel(c) {
 	case database.UpstreamChannelGrok:
 		return grokChannelAccountFilter(effectiveModel)
+	case database.UpstreamChannelAnthropic:
+		return anthropicChannelAccountFilter(effectiveModel)
 	case database.UpstreamChannelCodex:
 		return func(account *auth.Account) bool {
-			if account == nil || account.IsGrokAPI() {
+			if account == nil || account.IsGrokAPI() || account.IsAnthropicAPI() {
 				return false
 			}
 			return filter(account)
 		}
 	}
 	return filter
+}
+
+// anthropicChannelAccountFilter is the strict account pool for native Anthropic API keys.
+func anthropicChannelAccountFilter(model string) auth.AccountFilter {
+	model = strings.TrimSpace(model)
+	return func(account *auth.Account) bool {
+		if account == nil || !account.IsAnthropicAPI() || !account.SupportsAnthropicModel(model) {
+			return false
+		}
+		return model == "" || !account.IsModelRateLimited(model)
+	}
 }
 
 // grokChannelAccountFilter 是 grok 渠道 Key 的账号过滤器：仅 Grok 账号；
@@ -418,6 +431,9 @@ func accountFilterForResponsesModelResolver(effectiveModel string, allowCodexAcc
 		if account == nil {
 			return false
 		}
+		if account.IsAnthropicAPI() {
+			return false
+		}
 		if account.IsRelayStyle() {
 			routedModel := effectiveModel
 			if mappedModel, ok := resolveMapping(account); ok && mappedModel != "" {
@@ -443,6 +459,9 @@ func relayAccountSupportsModel(account *auth.Account, model string) bool {
 	}
 	if account.IsGrokAPI() {
 		return grokAccountSupportsVisibleModel(account, model)
+	}
+	if account.IsAnthropicAPI() {
+		return false
 	}
 	if account.SupportsOpenAIResponsesModel(model) {
 		return true
@@ -988,10 +1007,11 @@ func grokNativeVisibleEvent(protocol GrokProtocol, payload []byte) bool {
 }
 
 func noAvailableAnthropicAccountMessage(model string) string {
-	if isProOnlyModel(model) {
-		return "No available paid or unknown-plan account for gpt-5.3-codex-spark"
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "No available Anthropic accounts, please retry later"
 	}
-	return "No available accounts, please retry later"
+	return fmt.Sprintf("No available Anthropic account for %s, please retry later", model)
 }
 
 // NewHandler 创建处理器
@@ -2502,11 +2522,26 @@ func (h *Handler) authMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		if h.walletBeginBilling(c, apiKeyRow) {
-			defer h.finalizeWalletRequest(c)
+		// 纯本地/元数据端点（模型列表、token 计数探测）不消耗上游、不产生用量，
+		// 跳过钱包预留，避免每客户端轮询 /v1/models 都写一次预留/释放账本。
+		if !walletBillingExemptPath(c.Request.URL.Path) {
+			if h.walletBeginBilling(c, apiKeyRow) {
+				defer h.finalizeWalletRequest(c)
+			}
 		}
 		c.Next()
 	}
+}
+
+// walletBillingExemptPath 判断该路径是否不参与钱包计费（本地/元数据端点）。
+func walletBillingExemptPath(path string) bool {
+	switch strings.TrimSpace(path) {
+	case "/v1/models", "/models", "/backend-api/codex/models",
+		"/v1/messages/count_tokens", "/messages/count_tokens",
+		"/v1/responses/input_tokens", "/responses/input_tokens":
+		return true
+	}
+	return false
 }
 
 func apiKeyFromWebSocketSubprotocol(header string) string {

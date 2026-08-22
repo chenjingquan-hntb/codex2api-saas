@@ -102,6 +102,7 @@ export interface AccountRow {
   access_token_type?: string
   account_type?: string
   openai_responses_api?: boolean
+  anthropic_api?: boolean
   grok_api?: boolean
   agent_identity?: boolean
   grok_auth_kind?: string
@@ -293,7 +294,7 @@ export interface AccountLiveStateResponse {
 }
 
 export interface AccountsPageParams {
-  channel?: 'codex' | 'grok'
+  channel?: 'codex' | 'grok' | 'anthropic'
   page: number
   pageSize: number
   search?: string
@@ -371,7 +372,7 @@ export interface AccountPressureForecastAnalysis {
 }
 
 export interface AccountAnalysisResponse {
-  channel: 'codex' | 'grok'
+  channel: 'codex' | 'grok' | 'anthropic'
   quota: Record<'5h' | '7d', AccountQuotaAnalysis>
   recovery: Record<'5h' | '7d', AccountRecoveryAnalysis>
   reset: AccountResetAnalysis
@@ -381,7 +382,7 @@ export interface AccountAnalysisResponse {
 }
 
 export interface AccountOperationSelector {
-  channel: 'codex' | 'grok'
+  channel: 'codex' | 'grok' | 'anthropic'
   search?: string
   status?: string
   plan?: string
@@ -538,6 +539,7 @@ export interface RecycleBinAccountRow {
   at_only?: boolean
   access_token_type?: string
   openai_responses_api?: boolean
+  anthropic_api?: boolean
   base_url?: string
   models?: string[]
   created_at: ISODateString
@@ -609,6 +611,15 @@ export interface AddOpenAIResponsesAccountRequest {
   models: string[]
   model_mapping?: string
   codex_client_metadata_mode?: CodexClientMetadataMode
+  proxy_url: string
+  custom_headers?: Record<string, string> | null
+}
+
+export interface AddAnthropicAccountRequest {
+  name?: string
+  base_url: string
+  api_key: string
+  models: string[]
   proxy_url: string
   custom_headers?: Record<string, string> | null
 }
@@ -898,7 +909,7 @@ export interface AccountGroup {
   auto_pause_5h_threshold: number
   auto_pause_7d_threshold: number
   proxy_urls: string[]
-  channel: 'codex' | 'grok'
+  channel: 'codex' | 'grok' | 'anthropic'
   created_at: ISODateString
   updated_at: ISODateString
 }
@@ -916,7 +927,7 @@ export interface CreateAccountGroupRequest {
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
   proxy_urls?: string[]
-  channel?: 'codex' | 'grok'
+  channel?: 'codex' | 'grok' | 'anthropic'
 }
 
 export interface UpdateAccountGroupRequest {
@@ -928,7 +939,7 @@ export interface UpdateAccountGroupRequest {
   auto_pause_5h_threshold?: number
   auto_pause_7d_threshold?: number
   proxy_urls?: string[]
-  channel?: 'codex' | 'grok'
+  channel?: 'codex' | 'grok' | 'anthropic'
 }
 
 export interface AccountModelStat {
@@ -2759,7 +2770,7 @@ export interface APIKeyLimits {
   disable_image_generation?: boolean
   /** 图片工具策略：""/"allow" 放行、"strip" 剥离后继续文本请求、"block" 命中即 403。 */
   image_generation_policy?: "allow" | "strip" | "block"
-  upstream_channel?: "codex" | "grok"
+  upstream_channel?: "codex" | "grok" | "anthropic"
   /** 允许该 Key 使用 ChatGPT Live（/v1/live）。默认关闭。 */
   allow_live?: boolean
   /** 分组 / 账号维度的用量预算（issue #439）。 */

@@ -45,7 +45,11 @@ const (
 	HealthTierBanned  AccountHealthTier = "banned"
 )
 
-const UpstreamOpenAIResponses = "openai_responses"
+const (
+	UpstreamOpenAIResponses = "openai_responses"
+	// UpstreamAnthropic marks a native Anthropic Messages API key account.
+	UpstreamAnthropic = "anthropic"
+)
 
 const (
 	CodexClientMetadataModeAuto   = "auto"
@@ -427,7 +431,7 @@ func (a *Account) hasDispatchCredentialLocked() bool {
 	if a == nil {
 		return false
 	}
-	if a.isOpenAIResponsesAPILocked() {
+	if a.isOpenAIResponsesAPILocked() || a.isAnthropicAPILocked() {
 		return true
 	}
 	if a.isGrokAPILocked() {
@@ -448,6 +452,43 @@ func (a *Account) IsOpenAIResponsesAPI() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.isOpenAIResponsesAPILocked()
+}
+
+// isAnthropicAPILocked reports whether the account has a native Anthropic API key.
+func (a *Account) isAnthropicAPILocked() bool {
+	if a == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(a.UpstreamType), UpstreamAnthropic) && strings.TrimSpace(a.APIKey) != ""
+}
+
+// IsAnthropicAPI identifies native Anthropic Messages API key accounts.
+func (a *Account) IsAnthropicAPI() bool {
+	if a == nil {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.isAnthropicAPILocked()
+}
+
+// SupportsAnthropicModel applies the account's optional exact model allow-list.
+func (a *Account) SupportsAnthropicModel(model string) bool {
+	if a == nil || !a.IsAnthropicAPI() {
+		return false
+	}
+	model = strings.TrimSpace(model)
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	if len(a.Models) == 0 {
+		return true
+	}
+	for _, candidate := range a.Models {
+		if strings.EqualFold(strings.TrimSpace(candidate), model) {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Account) SupportsOpenAIResponsesModel(model string) bool {
@@ -4698,12 +4739,13 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	codexClientMetadataMode := NormalizeCodexClientMetadataMode(row.GetCredential("codex_client_metadata_mode"))
 	codexFingerprintMode := NormalizeCodexFingerprintMode(row.GetCredential(CodexFingerprintModeCredentialKey))
 	isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
+	isAnthropicAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamAnthropic) && strings.TrimSpace(apiKey) != ""
 	isGrokAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamGrok) && (strings.TrimSpace(apiKey) != "" || rt != "" || at != "")
 	// Agent Identity：无 AT/RT，凭 agent_private_key 动态签名，不能被下面的空凭据 guard 拒绝。
 	isAgentIdentityAccount := strings.EqualFold(strings.TrimSpace(row.GetCredential("auth_mode")), CodexAuthModeAgentIdentity) &&
 		strings.TrimSpace(row.GetCredential("agent_runtime_id")) != "" &&
 		strings.TrimSpace(row.GetCredential("agent_private_key")) != ""
-	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount && !isGrokAccount && !isAgentIdentityAccount {
+	if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount && !isAnthropicAccount && !isGrokAccount && !isAgentIdentityAccount {
 		log.Printf("[账号 %d] 缺少 refresh_token、session_token 和 access_token，跳过", row.ID)
 		return nil
 	}
@@ -4729,7 +4771,7 @@ func (s *Store) buildAccountFromRow(ctx context.Context, row *database.AccountRo
 	if account.CredentialGeneration <= 0 {
 		account.CredentialGeneration = 1
 	}
-	if isOpenAIResponsesAccount {
+	if isOpenAIResponsesAccount || isAnthropicAccount {
 		account.HealthTier = HealthTierHealthy
 		if account.PlanType == "" {
 			account.PlanType = "api"
@@ -7798,14 +7840,14 @@ func (s *Store) GetAPIKeyAllowedGroups(apiKeyID int64) []int64 {
 	return cloneInt64Slice(s.apiKeyAllowedGroups[apiKeyID])
 }
 
-// SetAPIKeyUpstreamChannel 设置某 API Key 的上游渠道限定（codex/grok，空=不限）。
+// SetAPIKeyUpstreamChannel 设置某 API Key 的上游渠道限定（codex/grok/anthropic，空=不限）。
 // 仅在取值真正变化时重建调度器。
 func (s *Store) SetAPIKeyUpstreamChannel(apiKeyID int64, channel string) {
 	if apiKeyID <= 0 {
 		return
 	}
 	channel = strings.ToLower(strings.TrimSpace(channel))
-	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok {
+	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok && channel != database.UpstreamChannelAnthropic {
 		channel = ""
 	}
 	s.apiKeyGroupsMu.Lock()
@@ -7888,14 +7930,19 @@ func (s *Store) APIKeyAllowsAccount(apiKeyID int64, acc *Account) bool {
 	allowedPlans := s.apiKeyAllowedPlanSets[apiKeyID]
 	channel := s.apiKeyUpstreamChannels[apiKeyID]
 	s.apiKeyGroupsMu.RUnlock()
-	// 渠道限定是硬门：grok 渠道只允许 Grok 账号，codex 渠道排除 Grok 账号。
+	// 渠道限定是硬门：每个固定渠道只能调度到对应上游账号；codex 渠道排除
+	// Grok 与原生 Anthropic 账号，避免 fast scheduler 绕过请求层过滤。
 	switch channel {
 	case database.UpstreamChannelGrok:
 		if !acc.IsGrokAPI() {
 			return false
 		}
+	case database.UpstreamChannelAnthropic:
+		if !acc.IsAnthropicAPI() {
+			return false
+		}
 	case database.UpstreamChannelCodex:
-		if acc.IsGrokAPI() {
+		if acc.IsGrokAPI() || acc.IsAnthropicAPI() {
 			return false
 		}
 	}

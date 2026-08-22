@@ -57,7 +57,7 @@ export default function OperationResultsModal({
 }: {
   state: AccountOperationResultsState | null;
   accounts: AccountRow[];
-  channel: "codex" | "grok";
+  channel: "codex" | "grok" | "anthropic";
   onClose: () => void;
 }) {
   const { t } = useTranslation();
@@ -175,7 +175,7 @@ export default function OperationResultsModal({
           <ChannelLogo
             channel={channel}
             size={26}
-            title={channel === "grok" ? "Grok" : "Codex"}
+            title={channel === "grok" ? "Grok" : channel === "anthropic" ? "Anthropic" : "Codex"}
           />
           <span>{title}</span>
         </span>

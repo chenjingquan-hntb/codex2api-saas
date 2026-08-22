@@ -68,11 +68,23 @@ export default function ChannelLogo({
   className,
   title,
 }: {
-  channel: "codex" | "grok";
+  channel: "codex" | "grok" | "anthropic";
   size?: number;
   className?: string;
   title?: string;
 }) {
+  if (channel === "anthropic") {
+    return (
+      <span
+        title={title ?? "Anthropic"}
+        className={cn("inline-flex shrink-0 items-center justify-center rounded-[20%] bg-[#d97757] font-bold text-white", className)}
+        style={{ width: size, height: size, fontSize: Math.max(9, size * 0.58) }}
+      >
+        A
+      </span>
+    );
+  }
+
   if (channel === "codex") {
     const src = URL_BY_FILE.get("codex-color");
     if (!src) return null;

@@ -114,6 +114,10 @@ func (db *DB) loadSetting(ctx context.Context, key string, target interface{}) e
 // BillingConfig 钱包计费配置。
 // 金额单位为整数微元（1e-7 元，见 money.go）；汇率倍率用于把上游美元成本
 // （database/billing.go 的 CalculateCost）换算成对用户收取的人民币。
+//
+// 精度说明：cny_per_usd 以 float64 承载（配置可读性），换算在 ComputeChargeMicro
+// 里 math.Round(usd*rate*1e7) 一次性转成整数微元；账本始终是整数、零浮点误差，
+// 仅极端金额下换算存在 ±1 微元的取整误差，对计费口径无实质影响。
 type BillingConfig struct {
 	Enabled        bool    `json:"enabled"`           // 总开关；关闭时数据面完全不走钱包
 	DepositMicro   int64   `json:"deposit_micro"`     // 每个请求预扣的预留额度（默认 ¥1）
@@ -141,6 +145,10 @@ func (c *BillingConfig) Sanitize() {
 	}
 	if c.MinChargeMicro < 0 {
 		c.MinChargeMicro = def.MinChargeMicro
+	}
+	// 预留必须覆盖最小扣费，否则结算兜底会把实扣封顶在预留额（管理端校验之外的双保险）。
+	if c.MinChargeMicro > 0 && c.DepositMicro < c.MinChargeMicro {
+		c.DepositMicro = c.MinChargeMicro
 	}
 	if c.ChargeCapMicro < 0 {
 		c.ChargeCapMicro = def.ChargeCapMicro

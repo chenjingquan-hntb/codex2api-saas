@@ -11,6 +11,7 @@ import type {
   AgentIdentityBatchImportResponse,
   AgentIdentityImportItem,
   AddOpenAIResponsesAccountRequest,
+  AddAnthropicAccountRequest,
   AddGrokAccountRequest,
   UpdateGrokAccountRequest,
   BatchUpdateGrokModelsRequest,
@@ -536,9 +537,9 @@ export const api = {
   deletePortalImageAsset: (apiKey: string, id: number) =>
     requestImageStudioPortal<MessageResponse>(`/assets/${id}`, apiKey, { method: 'DELETE' }),
   getStats: () => request<StatsResponse>('/stats'),
-  // channel: 'codex' | 'grok' — server-side filter; omit for all accounts.
+  // channel: 'codex' | 'grok' | 'anthropic' — server-side filter; omit for all accounts.
   // view: 'lite' — 只返回身份/绑定字段,跳过用量富化(代理绑定弹窗等场景)。
-  getAccounts: (params: { channel?: 'codex' | 'grok'; view?: 'lite' } = {}) => {
+  getAccounts: (params: { channel?: 'codex' | 'grok' | 'anthropic'; view?: 'lite' } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.channel) searchParams.set('channel', params.channel)
     if (params.view) searchParams.set('view', params.view)
@@ -568,7 +569,7 @@ export const api = {
     if (params.order) searchParams.set('order', params.order)
     return request<AccountsPageResponse>(`/accounts?${searchParams.toString()}`, { signal })
   },
-  getAccountAnalysis: (channel: 'codex' | 'grok' = 'codex', signal?: AbortSignal) =>
+  getAccountAnalysis: (channel: 'codex' | 'grok' | 'anthropic' = 'codex', signal?: AbortSignal) =>
     request<AccountAnalysisResponse>(`/accounts/analysis?channel=${channel}`, { signal }),
   getAccountPageStats: (ids: number[], signal?: AbortSignal) => {
     const query = new URLSearchParams({ ids: ids.join(',') })
@@ -588,6 +589,8 @@ export const api = {
     request<AgentIdentityBatchImportResponse>('/accounts/codex/agent-identity/import', { method: 'POST', body: JSON.stringify(data) }),
   addOpenAIResponsesAccount: (data: AddOpenAIResponsesAccountRequest) =>
     request<CreateAccountResponse>('/accounts/openai-responses', { method: 'POST', body: JSON.stringify(data) }),
+  addAnthropicAccount: (data: AddAnthropicAccountRequest) =>
+    request<CreateAccountResponse>('/accounts/anthropic', { method: 'POST', body: JSON.stringify(data) }),
   fetchOpenAIResponsesModels: (data: FetchOpenAIResponsesModelsRequest) =>
     request<FetchOpenAIResponsesModelsResponse>('/accounts/openai-responses/models', { method: 'POST', body: JSON.stringify(data) }),
   updateOpenAIResponsesAccount: (id: number, data: UpdateOpenAIResponsesAccountRequest) =>
@@ -1235,7 +1238,7 @@ export const api = {
     request<{ message: string; cleaned: number }>('/accounts/grok/clean-banned', { method: 'POST' }),
   cleanGrokError: () =>
     request<{ message: string; cleaned: number }>('/accounts/grok/clean-error', { method: 'POST' }),
-  exportAccounts: (params: { filter: 'healthy' | 'all'; ids?: number[]; channel?: 'codex' | 'grok' }) => {
+  exportAccounts: (params: { filter: 'healthy' | 'all'; ids?: number[]; channel?: 'codex' | 'grok' | 'anthropic' }) => {
     const sp = new URLSearchParams({ filter: params.filter })
     if (params.ids && params.ids.length > 0) sp.set('ids', params.ids.join(','))
     if (params.channel) sp.set('channel', params.channel)
@@ -1276,7 +1279,7 @@ export const api = {
     request<{ message: string; deleted: number }>('/proxies/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
   cleanErrorProxies: () =>
     request<{ message: string; cleaned: number; unbound: number }>('/proxies/clean-error', { method: 'POST' }),
-  autoBalanceProxies: (data: { channel?: 'codex' | 'grok'; mode?: 'unbound' | 'all'; max_per_proxy?: number; proxy_ids?: number[] }) =>
+  autoBalanceProxies: (data: { channel?: 'codex' | 'grok' | 'anthropic'; mode?: 'unbound' | 'all'; max_per_proxy?: number; proxy_ids?: number[] }) =>
     request<AutoBalanceProxiesResult>('/proxies/auto-balance', { method: 'POST', body: JSON.stringify(data) }),
   testProxy: (url: string, id?: number, lang?: string) =>
     request<ProxyTestResult>('/proxies/test', { method: 'POST', body: JSON.stringify({ url, id, lang }) }),

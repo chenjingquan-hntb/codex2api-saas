@@ -33,6 +33,7 @@ import type {
   AddAccountRequest,
   AddATAccountRequest,
   AddOpenAIResponsesAccountRequest,
+  AddAnthropicAccountRequest,
   CodexClientMetadataMode,
   CodexFingerprintMode,
   UpdateOpenAIResponsesAccountRequest,
@@ -286,7 +287,7 @@ type AccountGroupDraft = {
   auto_pause_5h_threshold: number;
   auto_pause_7d_threshold: number;
   proxyURLsInput: string;
-  channel: "codex" | "grok";
+  channel: "codex" | "grok" | "anthropic";
 };
 
 function getDefaultAccountVisibleColumns(): Record<
@@ -1536,12 +1537,14 @@ export default function Accounts() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [location.search]);
   const normalizedPath = location.pathname.replace(/\/+$/, "");
-  const providerView: "codex" | "grok" = normalizedPath.endsWith("/accounts/grok")
+  const providerView: "codex" | "grok" | "anthropic" = normalizedPath.endsWith("/accounts/grok")
     ? "grok"
-    : "codex";
+    : normalizedPath.endsWith("/accounts/anthropic")
+      ? "anthropic"
+      : "codex";
   const setProviderView = useCallback(
-    (view: "codex" | "grok") => {
-      navigate(view === "grok" ? "/accounts/grok" : "/accounts");
+    (view: "codex" | "grok" | "anthropic") => {
+      navigate(view === "grok" ? "/accounts/grok" : view === "anthropic" ? "/accounts/anthropic" : "/accounts");
     },
     [navigate],
   );
@@ -1690,7 +1693,7 @@ export default function Accounts() {
   // （选择器为空时自动隐藏，不影响手动填代理）。
   const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
   useEffect(() => {
-    if (providerView !== "codex") return;
+    if (providerView === "grok") return;
     let cancelled = false;
     void api
       .listProxies()
@@ -1770,7 +1773,7 @@ export default function Accounts() {
     done: false,
   });
   const [addMethod, setAddMethod] = useState<
-    "rt" | "st" | "at" | "session" | "openai" | "oauth" | "agentIdentity"
+    "rt" | "st" | "at" | "session" | "openai" | "anthropic" | "oauth" | "agentIdentity"
   >("oauth");
   const [agentIdentityJson, setAgentIdentityJson] = useState("");
   const [agentIdentityProxyUrl, setAgentIdentityProxyUrl] = useState("");
@@ -1854,8 +1857,12 @@ export default function Accounts() {
   // 分组按渠道隔离(issue #487):Codex 页的所有分组选择器只出 codex 渠道分组;
   // 管理器仍显示全部渠道(带徽标),徽标解析也用全量以兼容迁移前的跨渠道成员。
   const codexGroups = useMemo(
-    () => allGroups.filter((group) => group.channel !== "grok"),
+    () => allGroups.filter((group) => group.channel === "codex"),
     [allGroups],
+  );
+  const providerGroups = useMemo(
+    () => allGroups.filter((group) => group.channel === providerView),
+    [allGroups, providerView],
   );
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([]);
   const [lazyMode, setLazyMode] = useState(false);
@@ -1875,7 +1882,7 @@ export default function Accounts() {
     auto_pause_5h_threshold: 0,
     auto_pause_7d_threshold: 0,
     proxyURLsInput: "",
-    channel: "codex",
+    channel: providerView,
   });
   const [groupSubmitting, setGroupSubmitting] = useState(false);
   const [showBatchMetaEditor, setShowBatchMetaEditor] = useState(false);
@@ -2444,7 +2451,7 @@ export default function Accounts() {
     const controller = new AbortController();
     accountPageAbortRef.current = controller;
     const accountsResponse = await api.getAccountsPage({
-      channel: "codex",
+      channel: providerView,
       page,
       pageSize,
       search: debouncedSearchQuery,
@@ -2473,7 +2480,7 @@ export default function Accounts() {
       statsState: accountsResponse.stats_state,
       disabledSorts: accountsResponse.disabled_sorts ?? [],
     };
-  }, [authFilter, debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, page, pageSize, planFilter, sortDir, sortKey, statusFilter, tagFilter]);
+  }, [authFilter, debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, page, pageSize, planFilter, providerView, sortDir, sortKey, statusFilter, tagFilter]);
 
   const loadAccountAnalysis = useCallback(async (opts?: { silent?: boolean }) => {
     accountAnalysisAbortRef.current?.abort();
@@ -2484,7 +2491,7 @@ export default function Accounts() {
       setAccountAnalysisError(null);
     }
     try {
-      const response = await api.getAccountAnalysis("codex", controller.signal);
+      const response = await api.getAccountAnalysis(providerView, controller.signal);
       if (!controller.signal.aborted) setAccountAnalysis(response);
     } catch (analysisError) {
       if (!controller.signal.aborted && !opts?.silent) {
@@ -2493,12 +2500,12 @@ export default function Accounts() {
     } finally {
       if (!controller.signal.aborted && !opts?.silent) setAccountAnalysisLoading(false);
     }
-  }, []);
+  }, [providerView]);
 
   // Auxiliary data is intentionally independent from the account page request:
   // failures or slow settings/overview/group calls must not hold up the first row.
   useEffect(() => {
-    if (providerView !== "codex") return;
+    if (providerView === "grok") return;
     let cancelled = false;
     void api.getAPIKeys()
       .then((response) => { if (!cancelled) setAPIKeys(response.keys ?? []); })
@@ -2535,7 +2542,7 @@ export default function Accounts() {
     load: loadAccounts,
     // Grok 视图与本组件共用挂载:此时 codex 列表链(列表→health-bars→page-stats
     // →静默重载循环)必须整体停摆,否则在 Grok 页后台空转并连带整树重渲染。
-    enabled: providerView === "codex",
+    enabled: providerView !== "grok",
   });
   const disabledSorts = useMemo(
     () => resolveDisabledAccountSorts(data.disabledSorts, data.summary?.total),
@@ -2917,7 +2924,7 @@ export default function Accounts() {
   const allTags = data.facets.tags;
   const emailDomainStats = data.facets.email_domains;
   const currentAccountSelector = useMemo<AccountOperationSelector>(() => ({
-    channel: "codex",
+    channel: providerView,
     search: debouncedSearchQuery || undefined,
     status: statusFilter === "all" ? undefined : statusFilter,
     plan: planFilter === "all" ? undefined : planFilter,
@@ -2927,7 +2934,7 @@ export default function Accounts() {
     group_include: groupFilter.include.length > 0 ? groupFilter.include : undefined,
     group_exclude: groupFilter.exclude.length > 0 ? groupFilter.exclude : undefined,
     ungrouped: groupFilter.ungrouped || undefined,
-  }), [authFilter, debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, planFilter, statusFilter, tagFilter]);
+  }), [authFilter, debouncedSearchQuery, domainFilter, groupFilter.exclude, groupFilter.include, groupFilter.ungrouped, planFilter, providerView, statusFilter, tagFilter]);
 
   // 服务端已完成全池筛选、排序和分页。
   const filteredAccounts = accounts;
@@ -4483,7 +4490,7 @@ export default function Accounts() {
       const result = await runStreamingAccountOperation(
         "/accounts/batch-refresh?stream=true",
         allRefreshable
-          ? { selector: { channel: "codex", refreshable_only: true } }
+          ? { selector: { channel: providerView, refreshable_only: true } }
           : { ids: targetIds },
         t("accounts.batchRefreshProgressTitle"),
       );
@@ -5482,7 +5489,7 @@ export default function Accounts() {
       auto_pause_5h_threshold: 0,
       auto_pause_7d_threshold: 0,
       proxyURLsInput: "",
-      channel: "codex",
+      channel: providerView,
     });
   };
 
@@ -5500,7 +5507,12 @@ export default function Accounts() {
       auto_pause_5h_threshold: group.auto_pause_5h_threshold ?? 0,
       auto_pause_7d_threshold: group.auto_pause_7d_threshold ?? 0,
       proxyURLsInput: (group.proxy_urls ?? []).join("\n"),
-      channel: group.channel === "grok" ? "grok" : "codex",
+      channel:
+        group.channel === "grok"
+          ? "grok"
+          : group.channel === "anthropic"
+            ? "anthropic"
+            : "codex",
     });
   };
 
@@ -5581,6 +5593,37 @@ export default function Accounts() {
     }
   };
 
+  const handleAddAnthropic = async () => {
+    if (!openAIForm.api_key.trim()) return;
+    const parsedCustomHeaders = parseCustomHeadersText(addCustomHeadersText);
+    if (!parsedCustomHeaders.ok) {
+      showToast("自定义请求头必须是 JSON 对象，且所有值必须是字符串", "error");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const data: AddAnthropicAccountRequest = {
+        name: openAIForm.name,
+        base_url: openAIForm.base_url,
+        api_key: openAIForm.api_key,
+        models: openAIForm.models,
+        proxy_url: openAIForm.proxy_url,
+        custom_headers: parsedCustomHeaders.value,
+      };
+      await api.addAnthropicAccount(data);
+      showToast(t("accounts.addSuccess"));
+      setShowAdd(false);
+      setOpenAIForm({ base_url: "https://api.anthropic.com", api_key: "", models: [], proxy_url: "" });
+      setOpenAIModelDraft("");
+      setAddCustomHeadersText("");
+      void reload();
+    } catch (error) {
+      showToast(t("accounts.addFailed", { error: getErrorMessage(error) }), "error");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
   // 行操作实现每轮渲染都刷进 ref(始终指向最新闭包),对外暴露的 rowActions
   // 只创建一次,保证 memo 行组件的 props 引用稳定。
   const rowActionsImplRef = useRef<AccountRowActions | null>(null);
@@ -5637,16 +5680,17 @@ export default function Accounts() {
   // 不复用 Codex 侧的导入/导出/邀请/回收站等入口，Grok 页只保留账号本身的增删启停。
   // useMemo 保持引用稳定,否则每轮渲染的新元素会击穿 GrokAccounts 的 memo 边界。
   const providerSwitcher = useMemo(() => (
-    <div className="relative grid grid-cols-2 items-center rounded-lg border border-border bg-muted/40 p-0.5">
+    <div className="relative grid grid-cols-3 items-center rounded-lg border border-border bg-muted/40 p-0.5">
       <span
         aria-hidden
-        className="absolute inset-y-0.5 left-0.5 w-[calc((100%-4px)/2)] rounded-md bg-background shadow-sm transition-transform duration-300 ease-out"
-        style={{ transform: `translateX(${providerView === "grok" ? 100 : 0}%)` }}
+        className="absolute inset-y-0.5 left-0.5 w-[calc((100%-4px)/3)] rounded-md bg-background shadow-sm transition-transform duration-300 ease-out"
+        style={{ transform: `translateX(${providerView === "grok" ? 100 : providerView === "anthropic" ? 200 : 0}%)` }}
       />
       {(
         [
           ["codex", t("accounts.providerViewCodex")],
           ["grok", t("accounts.providerViewGrok")],
+          ["anthropic", "Anthropic"],
         ] as const
       ).map(([key, label]) => (
         <button
@@ -5712,7 +5756,7 @@ export default function Accounts() {
       <OperationResultsModal
         state={showOperationResults ? operationResults : null}
         accounts={accounts}
-        channel="codex"
+        channel={providerView}
         onClose={() => setOperationResults(null)}
       />
       <StateShell
@@ -5785,6 +5829,7 @@ export default function Accounts() {
                             />
                           ),
                           disabled:
+                            providerView === "anthropic" ||
                             batchLoading ||
                             batchTesting ||
                             data.total === 0,
@@ -6324,7 +6369,7 @@ export default function Accounts() {
                 />
                 <AccountGroupFilterSelect
                   className="w-full min-w-0 sm:w-40"
-                  groups={codexGroups}
+                  groups={providerGroups}
                   value={groupFilter}
                   onChange={(value) => {
                     setGroupFilter(value);
@@ -6671,17 +6716,19 @@ export default function Accounts() {
                     <span>{t("accounts.selectCurrentPage")}</span>
                   </Button>
                 )}
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={batchLoading || batchTesting}
-                  onClick={() => void handleBatchRefresh()}
-                >
-                  <RefreshCw
-                    className={`size-3.5 ${batchRefreshing ? "animate-spin" : ""}`}
-                  />
-                  <span className="hidden sm:inline">{t("accounts.batchRefresh")}</span>
-                </Button>
+                {providerView !== "anthropic" && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={batchLoading || batchTesting}
+                    onClick={() => void handleBatchRefresh()}
+                  >
+                    <RefreshCw
+                      className={`size-3.5 ${batchRefreshing ? "animate-spin" : ""}`}
+                    />
+                    <span className="hidden sm:inline">{t("accounts.batchRefresh")}</span>
+                  </Button>
+                )}
                 <Button
                   variant="outline"
                   size="sm"
@@ -7204,6 +7251,13 @@ export default function Accounts() {
                   >
                     {submitting ? t("accounts.adding") : t("accounts.submit")}
                   </Button>
+                ) : addMethod === "anthropic" ? (
+                  <Button
+                    onClick={() => void handleAddAnthropic()}
+                    disabled={submitting || !openAIForm.api_key.trim()}
+                  >
+                    {submitting ? t("accounts.adding") : t("accounts.submit")}
+                  </Button>
                 ) : addMethod === "agentIdentity" ? (
                   <Button
                     onClick={() => void handleAddAgentIdentity()}
@@ -7307,6 +7361,20 @@ export default function Accounts() {
               >
                 <KeyRound className="size-3.5" />
                 {t("accounts.addMethodOpenAI")}
+              </button>
+              <button
+                onClick={() => {
+                  setAddMethod("anthropic");
+                  setOpenAIForm((form) => ({ ...form, base_url: "https://api.anthropic.com" }));
+                }}
+                className={`min-w-0 flex-1 flex items-center justify-center gap-1.5 rounded-lg px-2 py-2 text-sm font-semibold whitespace-nowrap transition-all ${
+                  addMethod === "anthropic"
+                    ? "bg-background shadow-sm text-foreground"
+                    : "text-muted-foreground hover:text-foreground"
+                }`}
+              >
+                <KeyRound className="size-3.5" />
+                Anthropic
               </button>
               <button
                 onClick={() => setAddMethod("agentIdentity")}
@@ -7640,6 +7708,34 @@ export default function Accounts() {
                   onChange: setAddCustomHeadersText,
                 })}
               </div>
+            ) : addMethod === "anthropic" ? (
+              <div className="space-y-4">
+                <div className="rounded-xl border border-orange-200 bg-orange-50 px-4 py-3 text-sm text-orange-800 dark:border-orange-800 dark:bg-orange-950/50 dark:text-orange-300">
+                  Anthropic Messages API 账号使用标准 API Key；模型白名单可选，留空表示允许请求中的任意模型。
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">账号名称</label>
+                  <Input value={openAIForm.name ?? ""} onChange={(event) => setOpenAIForm((form) => ({ ...form, name: event.target.value }))} placeholder="Anthropic account" />
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">Base URL</label>
+                  <Input value={openAIForm.base_url} onChange={(event) => setOpenAIForm((form) => ({ ...form, base_url: event.target.value }))} placeholder="https://api.anthropic.com" />
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">Anthropic API Key *</label>
+                  <Input type="password" value={openAIForm.api_key} onChange={(event) => setOpenAIForm((form) => ({ ...form, api_key: event.target.value }))} placeholder="sk-ant-..." />
+                </div>
+                <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">模型白名单（可选）</label>
+                  <div className="mb-3 flex gap-2">
+                    <Input placeholder="claude-sonnet-4-20250514" value={openAIModelDraft} onChange={(event) => setOpenAIModelDraft(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addOpenAIModelValues(openAIModelDraft); } }} />
+                    <Button type="button" variant="outline" onClick={() => addOpenAIModelValues(openAIModelDraft)} disabled={!openAIModelDraft.trim()}><Plus className="size-3.5" />添加</Button>
+                  </div>
+                  <ModelChipGrid models={openAIForm.models} onRemove={removeOpenAIModel} emptyLabel="未限制模型" />
+                </div>
+                {renderProxyInput({ value: openAIForm.proxy_url, testKey: "add-anthropic", onChange: (value) => setOpenAIForm((form) => ({ ...form, proxy_url: value })) })}
+                {renderCustomHeadersTextarea({ value: addCustomHeadersText, onChange: setAddCustomHeadersText })}
+              </div>
             ) : addMethod === "agentIdentity" ? (
               <div className="space-y-4">
                 <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800 dark:border-blue-800 dark:bg-blue-950/50 dark:text-blue-300">
@@ -7849,7 +7945,7 @@ export default function Accounts() {
                   {t("accounts.importGroupsLabel")}
                 </label>
                 <AccountGroupMultiSelect
-                  groups={codexGroups}
+                  groups={providerGroups}
                   value={importGroupIds}
                   onChange={setImportGroupIds}
                   allLabel={t("accounts.groupsUnbound")}
@@ -7914,7 +8010,7 @@ export default function Accounts() {
                   {t("accounts.importGroupsLabel")}
                 </label>
                 <AccountGroupMultiSelect
-                  groups={codexGroups}
+                  groups={providerGroups}
                   value={importGroupIds}
                   onChange={setImportGroupIds}
                   allLabel={t("accounts.groupsUnbound")}
@@ -9278,7 +9374,7 @@ export default function Accounts() {
                           </div>
                           <div className="mt-3">
                             <AccountGroupMultiSelect
-                              groups={codexGroups}
+                              groups={providerGroups}
                               value={editGroupIds}
                               onChange={setEditGroupIds}
                               allLabel={t("accounts.groupsUnbound")}
@@ -9390,7 +9486,7 @@ export default function Accounts() {
                 </Button>
               </div>
               <AccountGroupMultiSelect
-                groups={codexGroups}
+                groups={providerGroups}
                 value={quickGroupIds}
                 onChange={setQuickGroupIds}
                 allLabel={t("accounts.groupsUnbound")}
@@ -9835,7 +9931,7 @@ export default function Accounts() {
                 </div>
                 <div className="mt-3">
                   <AccountGroupMultiSelect
-                    groups={codexGroups}
+                    groups={providerGroups}
                     value={batchGroupIds}
                     onChange={setBatchGroupIds}
                     allLabel={t(
@@ -10048,7 +10144,7 @@ export default function Accounts() {
                                     : "bg-sky-50 text-sky-700 dark:bg-sky-950 dark:text-sky-300"
                                 }`}
                               >
-                                {group.channel === "grok" ? "Grok" : "Codex"}
+                                {group.channel === "grok" ? "Grok" : group.channel === "anthropic" ? "Anthropic" : "Codex"}
                               </span>
                               <span className="shrink-0 rounded-md bg-muted px-1.5 py-0.5 text-[11px] font-semibold text-muted-foreground">
                                 {t("accounts.groupMembers")}{" "}
@@ -10142,7 +10238,7 @@ export default function Accounts() {
                       return (
                         <>
                           <div className="flex gap-2">
-                            {(["codex", "grok"] as const).map((channel) => (
+                            {(["codex", "grok", "anthropic"] as const).map((channel) => (
                               <button
                                 key={channel}
                                 type="button"
@@ -10159,7 +10255,7 @@ export default function Accounts() {
                                   }))
                                 }
                               >
-                                {channel === "grok" ? "Grok" : "Codex"}
+                                {channel === "grok" ? "Grok" : channel === "anthropic" ? "Anthropic" : "Codex"}
                               </button>
                             ))}
                           </div>
@@ -12676,11 +12772,15 @@ function AccountRowActionsMenu({
   onDelete: () => void;
 }) {
   const refreshDisabled =
-    refreshing || account.at_only || account.openai_responses_api;
+    refreshing ||
+    account.at_only ||
+    account.openai_responses_api ||
+    account.anthropic_api;
   const authJsonDisabled =
     authJsonExporting ||
     account.at_only ||
     account.openai_responses_api ||
+    account.anthropic_api ||
     account.grok_api ||
     account.agent_identity;
   const resetCredits = account.rate_limit_reset_credits ?? 0;
@@ -12706,7 +12806,7 @@ function AccountRowActionsMenu({
       ),
       disabled: refreshDisabled,
       title:
-        account.at_only || account.openai_responses_api
+        account.at_only || account.openai_responses_api || account.anthropic_api
           ? t("accounts.atRefreshDisabled")
           : undefined,
       onSelect: onRefresh,
@@ -12719,6 +12819,7 @@ function AccountRowActionsMenu({
       title:
         account.at_only ||
         account.openai_responses_api ||
+        account.anthropic_api ||
         account.grok_api ||
         account.agent_identity
           ? t("accounts.authJsonDisabled")

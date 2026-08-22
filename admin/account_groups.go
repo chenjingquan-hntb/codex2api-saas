@@ -13,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
@@ -473,6 +474,9 @@ func accountRowGroupChannel(row *database.AccountRow) string {
 	if isGrokAccountRow(row) {
 		return database.AccountGroupChannelGrok
 	}
+	if strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamAnthropic) {
+		return database.AccountGroupChannelAnthropic
+	}
 	return database.AccountGroupChannelCodex
 }
 
@@ -512,8 +516,12 @@ func (h *Handler) validateGroupChannelForRows(ctx context.Context, rows []*datab
 }
 
 func groupChannelDisplayName(channel string) string {
-	if channel == database.AccountGroupChannelGrok {
+	switch channel {
+	case database.AccountGroupChannelGrok:
 		return "Grok"
+	case database.AccountGroupChannelAnthropic:
+		return "Anthropic"
+	default:
+		return "Codex"
 	}
-	return "Codex"
 }

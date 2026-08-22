@@ -26,6 +26,7 @@ func (h *Handler) buildAccountResponse(
 	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
 	isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
 	isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
+	isAnthropicAccount := strings.EqualFold(upstreamType, auth.UpstreamAnthropic)
 	grokAuthKind := ""
 	var grokBilling json.RawMessage
 	if isGrokAccount {
@@ -43,11 +44,11 @@ func (h *Handler) buildAccountResponse(
 	}
 	email := row.GetCredential("email")
 	baseURL := row.GetCredential("base_url")
-	if isOpenAIResponsesAccount && email == "" {
+	if (isOpenAIResponsesAccount || isAnthropicAccount) && email == "" {
 		email = baseURL
 	}
 	planType := row.GetCredential("plan_type")
-	if isOpenAIResponsesAccount && planType == "" {
+	if (isOpenAIResponsesAccount || isAnthropicAccount) && planType == "" {
 		planType = "api"
 	}
 	if isGrokAccount && grokAuthKind == auth.GrokAuthKindAPIKey {
@@ -107,13 +108,14 @@ func (h *Handler) buildAccountResponse(
 		SubscriptionExpiresAt:    row.GetCredential("subscription_expires_at"),
 		Status:                   row.Status,
 		ErrorMessage:             row.ErrorMessage,
-		ATOnly:                   !isOpenAIResponsesAccount && !isGrokAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+		ATOnly:                   !isOpenAIResponsesAccount && !isGrokAccount && !isAnthropicAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 		CreditEnabled:            row.CreditEnabled,
 		CreditSkipUsageWindow:    row.CreditSkipUsageWindow,
 		SkipWarmTier:             row.SkipWarmTier,
 		AccountType:              row.Type,
 		AccessTokenType:          accountAccessTokenType(row),
 		OpenAIResponsesAPI:       isOpenAIResponsesAccount,
+		AnthropicAPI:             isAnthropicAccount,
 		GrokAPI:                  isGrokAccount,
 		AgentIdentity:            isAgentIdentityCredentialRow(row),
 		GrokAuthKind:             grokAuthKind,

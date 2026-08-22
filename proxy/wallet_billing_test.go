@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/codex2api/database"
@@ -236,5 +237,72 @@ func TestWalletAccumulateSkipsFailedUsage(t *testing.T) {
 	acc := walletAccount(t, db, userID)
 	if acc.AvailableMicro != 10_000_000 || acc.ReservedMicro != 0 {
 		t.Fatalf("failed usage must not charge: avail=%d reserved=%d", acc.AvailableMicro, acc.ReservedMicro)
+	}
+}
+
+// TestWalletFailClosedWhenConfigUnavailable 校验 fail-closed：钱包 DB/配置不可用时，
+// 用户归属 Key 的计费请求被 503 拒绝，而不是 fail-open 放行。
+func TestWalletFailClosedWhenConfigUnavailable(t *testing.T) {
+	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "wallet-failclosed.db"))
+	if err != nil {
+		t.Fatalf("db: %v", err)
+	}
+	// DB.Close() 非幂等（内部 close(channel)），用 Once 包装，测试中途与 Cleanup 只关一次。
+	var closeOnce sync.Once
+	closeDB := func() { closeOnce.Do(func() { _ = db.Close() }) }
+	t.Cleanup(closeDB)
+	ctx := context.Background()
+	user, err := db.CreateUser(ctx, "failclosed@test.dev", "x")
+	if err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if _, err := db.WalletCredit(ctx, user.ID, 10_000_000, database.WalletTxRecharge, "seed", "fc-1", "seed:fc-1", 0, "test seed"); err != nil {
+		t.Fatalf("credit: %v", err)
+	}
+	// 先写入开启的计费配置，让缓存路径可用。
+	enableBilling(t, db, &database.BillingConfig{Enabled: true, DepositMicro: 1_000_000, CNYPerUSD: 12.0})
+	h := &Handler{db: db}
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	if !h.walletBeginBilling(c, &database.APIKeyRow{ID: 1, UserID: user.ID}) {
+		t.Fatalf("expected billing to begin with healthy db (status=%d body=%s)", rec.Code, rec.Body.String())
+	}
+
+	// 关闭 DB 并失效缓存后新请求必须 fail-closed 503。
+	closeDB()
+	h.InvalidateWalletConfigCache()
+	rec2 := httptest.NewRecorder()
+	c2, _ := gin.CreateTestContext(rec2)
+	c2.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	if h.walletBeginBilling(c2, &database.APIKeyRow{ID: 1, UserID: user.ID}) {
+		t.Fatal("billing must NOT begin when wallet DB is down (fail-closed)")
+	}
+	if rec2.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 (body=%s)", rec2.Code, rec2.Body.String())
+	}
+	if !strings.Contains(rec2.Body.String(), "service_unavailable") {
+		t.Fatalf("body missing service_unavailable: %s", rec2.Body.String())
+	}
+}
+
+// TestWalletBillingExemptPaths 校验元数据/本地端点不参与计费。
+func TestWalletBillingExemptPaths(t *testing.T) {
+	exempt := []string{
+		"/v1/models", "/models", "/backend-api/codex/models",
+		"/v1/messages/count_tokens", "/messages/count_tokens",
+		"/v1/responses/input_tokens", "/responses/input_tokens",
+	}
+	for _, p := range exempt {
+		if !walletBillingExemptPath(p) {
+			t.Fatalf("path %s must be exempt from wallet billing", p)
+		}
+	}
+	notExempt := []string{"/v1/responses", "/v1/chat/completions", "/v1/messages", "/v1/images/generations"}
+	for _, p := range notExempt {
+		if walletBillingExemptPath(p) {
+			t.Fatalf("path %s must NOT be exempt from wallet billing", p)
+		}
 	}
 }

@@ -1543,6 +1543,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_image_assets_created ON image_assets(created_at);
 	CREATE INDEX IF NOT EXISTS idx_image_assets_job_id ON image_assets(job_id);
+
 	-- ==================== 用户与钱包（控制面，P5/P6） ====================
 	-- 所有金额一律用整数微元（1e-7 元）表示，见 database/money.go；
 	-- 账本权威禁浮点，Redis 只做缓存/锁。
@@ -1620,7 +1621,9 @@ func (db *DB) migrate(ctx context.Context) error {
 		reason               TEXT DEFAULT '',
 		created_at           TIMESTAMPTZ DEFAULT NOW()
 	);
-	CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_ledger_idempotency ON wallet_ledger_entries(idempotency_key);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_ledger_user_idempotency ON wallet_ledger_entries(user_id, idempotency_key);
+	-- 旧全局唯一索引（P5 初版）改为按用户维度的复合唯一，避免将来订单号等幂等键跨用户误判重放。
+	DROP INDEX IF EXISTS idx_wallet_ledger_idempotency;
 	CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user_created ON wallet_ledger_entries(user_id, created_at);
 
 	CREATE TABLE IF NOT EXISTS wallet_transactions (
@@ -1781,9 +1784,10 @@ const (
 
 // 上游渠道限定取值。
 const (
-	UpstreamChannelAuto  = ""
-	UpstreamChannelCodex = "codex"
-	UpstreamChannelGrok  = "grok"
+	UpstreamChannelAuto      = ""
+	UpstreamChannelCodex     = "codex"
+	UpstreamChannelGrok      = "grok"
+	UpstreamChannelAnthropic = "anthropic"
 )
 
 // ResolveUpstreamChannel 归一 Key 的上游渠道限定；未知值一律视为不限（auto）。
@@ -1793,6 +1797,8 @@ func (l APIKeyLimits) ResolveUpstreamChannel() string {
 		return UpstreamChannelCodex
 	case UpstreamChannelGrok:
 		return UpstreamChannelGrok
+	case UpstreamChannelAnthropic:
+		return UpstreamChannelAnthropic
 	}
 	return UpstreamChannelAuto
 }
@@ -6180,6 +6186,12 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 	channel = strings.ToLower(strings.TrimSpace(channel))
 	where := `status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
 	switch channel {
+	case UpstreamChannelAnthropic:
+		if db.isSQLite() {
+			where += ` AND LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) = 'anthropic'`
+		} else {
+			where += ` AND LOWER(COALESCE(credentials->>'upstream_type', '')) = 'anthropic'`
+		}
 	case UpstreamChannelGrok:
 		if db.isSQLite() {
 			where += ` AND LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) = 'grok'`
@@ -6189,9 +6201,9 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 	case UpstreamChannelCodex:
 		// 非 grok 一律归入 codex 视图（缺省 upstream_type 的历史号也算 codex 侧）。
 		if db.isSQLite() {
-			where += ` AND LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) <> 'grok'`
+			where += ` AND LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) NOT IN ('grok', 'anthropic')`
 		} else {
-			where += ` AND LOWER(COALESCE(credentials->>'upstream_type', '')) <> 'grok'`
+			where += ` AND LOWER(COALESCE(credentials->>'upstream_type', '')) NOT IN ('grok', 'anthropic')`
 		}
 	}
 

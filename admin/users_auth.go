@@ -76,10 +76,11 @@ func (logOnlyUserMailer) SendPasswordResetEmail(_ context.Context, to, resetURL 
 
 // keyedRateLimiter 按 key（IP/邮箱）的滑动窗口计数限流。
 type keyedRateLimiter struct {
-	mu    sync.Mutex
-	hits  map[string][]time.Time
-	limit int
-	win   time.Duration
+	mu     sync.Mutex
+	hits   map[string][]time.Time
+	limit  int
+	win    time.Duration
+	lastGC time.Time
 }
 
 func newKeyedRateLimiter(limit int, win time.Duration) *keyedRateLimiter {
@@ -90,6 +91,7 @@ func newKeyedRateLimiter(limit int, win time.Duration) *keyedRateLimiter {
 func (l *keyedRateLimiter) allow(key string, now time.Time) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.gcIfDue(now)
 	cutoff := now.Add(-l.win)
 	kept := l.hits[key][:0]
 	for _, t := range l.hits[key] {
@@ -103,6 +105,32 @@ func (l *keyedRateLimiter) allow(key string, now time.Time) bool {
 	}
 	l.hits[key] = append(kept, now)
 	return true
+}
+
+// gcIfDue 每经过一个窗口周期清扫一次：删除已无记录的 key，防止长运行下 map 无界增长。
+func (l *keyedRateLimiter) gcIfDue(now time.Time) {
+	if l.lastGC.IsZero() {
+		l.lastGC = now
+		return
+	}
+	if now.Sub(l.lastGC) < l.win {
+		return
+	}
+	l.lastGC = now
+	cutoff := now.Add(-l.win)
+	for k, ts := range l.hits {
+		kept := ts[:0]
+		for _, t := range ts {
+			if t.After(cutoff) {
+				kept = append(kept, t)
+			}
+		}
+		if len(kept) == 0 {
+			delete(l.hits, k)
+			continue
+		}
+		l.hits[k] = kept
+	}
 }
 
 // ==================== 请求上下文 ====================
@@ -159,6 +187,22 @@ func newOpaqueToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+var (
+	dummyHashOnce sync.Once
+	dummyHashVal  string
+)
+
+// dummyArgon2Hash 返回一个预计算的 Argon2id 哈希（惰性生成一次），用于未知邮箱
+// 登录时做等开销校验，抹平「邮箱已注册/未注册」的响应时长差异（防时序枚举）。
+func dummyArgon2Hash() string {
+	dummyHashOnce.Do(func() {
+		if h, err := database.HashPassword("codex2api-timing-dummy-password"); err == nil {
+			dummyHashVal = h
+		}
+	})
+	return dummyHashVal
 }
 
 // portalBaseURLFromEnv 读取 PUBLIC_BASE_URL 环境变量（可选）。
@@ -249,7 +293,9 @@ func (h *Handler) RegisterUser(c *gin.Context) {
 	h.issueVerification(c, user.ID, email, http.StatusCreated)
 }
 
-// issueVerification 签发邮箱验证 token 并（尝试）发送邮件；响应携带是否已发信与 dev URL。
+// issueVerification 签发邮箱验证 token 并（尝试）发送邮件。
+// 仅当邮件实际未配置（dev 模式）时响应才携带 dev_verify_url；SMTP 已配置并发出时
+// 不再把一次性 token 泄漏到响应/日志/浏览器历史。
 func (h *Handler) issueVerification(c *gin.Context, userID int64, email string, statusCode int) {
 	token, err := newOpaqueToken()
 	if err != nil {
@@ -263,20 +309,24 @@ func (h *Handler) issueVerification(c *gin.Context, userID int64, email string, 
 	base := portalBaseURL(c)
 	verifyURL := fmt.Sprintf("%s/verify-email?token=%s", base, token)
 	emailSent := false
-	if err := h.userMailer.SendVerificationEmail(c.Request.Context(), email, verifyURL); err != nil {
-		if !errors.Is(err, ErrMailerNotConfigured) {
-			log.Printf("发送验证邮件失败: email=%s err=%v", security.SanitizeLog(email), err)
+	mailErr := h.userMailer.SendVerificationEmail(c.Request.Context(), email, verifyURL)
+	if mailErr != nil {
+		if !errors.Is(mailErr, ErrMailerNotConfigured) {
+			log.Printf("发送验证邮件失败: email=%s err=%v", security.SanitizeLog(email), mailErr)
 		}
 	} else {
 		emailSent = true
 	}
-	c.JSON(statusCode, gin.H{
-		"user_id":        userID,
-		"email":          email,
-		"email_sent":     emailSent,
-		"dev_verify_url": verifyURL,
-		"message":        "注册成功，请查收邮件完成邮箱验证",
-	})
+	resp := gin.H{
+		"user_id":    userID,
+		"email":      email,
+		"email_sent": emailSent,
+		"message":    "注册成功，请查收邮件完成邮箱验证",
+	}
+	if errors.Is(mailErr, ErrMailerNotConfigured) {
+		resp["dev_verify_url"] = verifyURL
+	}
+	c.JSON(statusCode, resp)
 }
 
 type verifyEmailRequest struct {
@@ -304,6 +354,17 @@ func (h *Handler) VerifyEmail(c *gin.Context) {
 		default:
 			writeInternalError(c, err)
 		}
+		return
+	}
+	// 封禁用户不可通过验证自解封（token 已消费，不再可用）。
+	user, err := h.db.GetUserByID(ctx, userID)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	if user.IsBanned() {
+		security.SecurityAuditLog("USER_EMAIL_VERIFY_BANNED", "user_id="+strconv.FormatInt(userID, 10))
+		writeError(c, http.StatusForbidden, "账号已被封禁，无法验证邮箱")
 		return
 	}
 	if err := h.db.SetUserEmailVerified(ctx, userID); err != nil {
@@ -379,7 +440,11 @@ func (h *Handler) LoginUser(c *gin.Context) {
 
 	user, err := h.db.GetUserByEmail(c.Request.Context(), email)
 	if err != nil || user == nil {
-		// 统一口径防枚举。
+		// 统一口径防枚举 + 时序均衡：未知邮箱也执行一次等开销的 Argon2 校验，
+		// 避免攻击者以响应时长区分「邮箱已注册」与「未注册」。
+		if hash := dummyArgon2Hash(); hash != "" {
+			_, _ = database.VerifyPassword(hash, req.Password)
+		}
 		writeError(c, http.StatusUnauthorized, "邮箱或密码错误")
 		return
 	}
@@ -566,19 +631,24 @@ func (h *Handler) RequestPasswordReset(c *gin.Context) {
 	base := portalBaseURL(c)
 	resetURL := fmt.Sprintf("%s/reset-password?token=%s", base, token)
 	emailSent := false
-	if err := h.userMailer.SendPasswordResetEmail(c.Request.Context(), email, resetURL); err != nil {
-		if !errors.Is(err, ErrMailerNotConfigured) {
-			log.Printf("发送重置邮件失败: email=%s err=%v", security.SanitizeLog(email), err)
+	mailErr := h.userMailer.SendPasswordResetEmail(c.Request.Context(), email, resetURL)
+	if mailErr != nil {
+		if !errors.Is(mailErr, ErrMailerNotConfigured) {
+			log.Printf("发送重置邮件失败: email=%s err=%v", security.SanitizeLog(email), mailErr)
 		}
 	} else {
 		emailSent = true
 	}
 	security.SecurityAuditLog("USER_PASSWORD_RESET_REQUESTED", "user_id="+strconv.FormatInt(user.ID, 10)+" ip="+security.SanitizeLog(ip))
-	c.JSON(http.StatusOK, gin.H{
-		"email_sent":    emailSent,
-		"dev_reset_url": resetURL,
-		"message":       "如果该邮箱已注册，重置邮件已发送",
-	})
+	resp := gin.H{
+		"email_sent": emailSent,
+		"message":    "如果该邮箱已注册，重置邮件已发送",
+	}
+	// 仅未配置 SMTP（dev 模式）时回传一次性重置链接，避免生产环境 token 泄漏。
+	if errors.Is(mailErr, ErrMailerNotConfigured) {
+		resp["dev_reset_url"] = resetURL
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 type resetPasswordRequest struct {

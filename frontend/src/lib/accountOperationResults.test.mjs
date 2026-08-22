@@ -184,19 +184,21 @@ test("paginateAccountOperationResults pages large result sets on the client", ()
   assert.equal(lastPage.results[49].accountId, 1000);
 });
 
-test("resolveChannelBatchTestAccountIDs keeps Codex and Grok tests isolated", () => {
+test("resolveChannelBatchTestAccountIDs keeps provider tests isolated", () => {
   const accounts = [
     { id: 1 },
     { id: 2, grok_api: false },
     { id: 3, grok_api: true },
+    { id: 4, anthropic_api: true },
   ];
 
   assert.deepEqual(resolveChannelBatchTestAccountIDs(accounts, "codex"), [
     1, 2,
   ]);
   assert.deepEqual(resolveChannelBatchTestAccountIDs(accounts, "grok"), [3]);
+  assert.deepEqual(resolveChannelBatchTestAccountIDs(accounts, "anthropic"), [4]);
   assert.deepEqual(
-    resolveChannelBatchTestAccountIDs(accounts, "codex", [3, 2, 2, 99, 1]),
+    resolveChannelBatchTestAccountIDs(accounts, "codex", [3, 4, 2, 2, 99, 1]),
     [2, 1],
   );
 });

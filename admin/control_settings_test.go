@@ -103,6 +103,7 @@ func TestUpdateBillingValidation(t *testing.T) {
 		{"zero deposit", `{"deposit_micro":0}`},
 		{"negative cny", `{"cny_per_usd":-3}`},
 		{"cap below min", `{"min_charge_micro":100000,"charge_cap_micro":50000}`},
+		{"deposit below min", `{"deposit_micro":100000,"min_charge_micro":200000}`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

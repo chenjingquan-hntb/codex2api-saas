@@ -210,8 +210,8 @@ func (h *Handler) resolveAccountOperationSelector(ctx context.Context, selector 
 		return nil, fmt.Errorf("selector is required")
 	}
 	channel := strings.ToLower(strings.TrimSpace(selector.Channel))
-	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok {
-		return nil, fmt.Errorf("selector channel must be codex or grok")
+	if channel != database.UpstreamChannelCodex && channel != database.UpstreamChannelGrok && channel != database.UpstreamChannelAnthropic {
+		return nil, fmt.Errorf("selector channel must be codex, grok, or anthropic")
 	}
 	snapshot, err := h.getAccountListSnapshot(ctx, channel)
 	if err != nil {

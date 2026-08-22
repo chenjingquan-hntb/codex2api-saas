@@ -133,10 +133,10 @@ func (a *Account) IsGrokAPI() bool {
 	return a.isGrokAPILocked()
 }
 
-// isRelayStyleLocked：openai_responses 中转或 Grok —— 一切「非 Codex OAuth 官方上游」
+// isRelayStyleLocked：外部 API 上游（OpenAI Responses、Anthropic 或 Grok）—— 一切「非 Codex OAuth 官方上游」
 // 的账号。这类账号不参与 Codex 专属行为（wham 探针、WS 上游、manifest、alpha search）。
 func (a *Account) isRelayStyleLocked() bool {
-	return a.isOpenAIResponsesAPILocked() || a.isGrokAPILocked()
+	return a.isOpenAIResponsesAPILocked() || a.isAnthropicAPILocked() || a.isGrokAPILocked()
 }
 
 // IsRelayStyle 判断账号是否为「非 Codex 官方」的外部上游账号（中转或 Grok）。

@@ -97,7 +97,13 @@ func (h *Handler) UpdateControlSettingsSection(c *gin.Context) {
 			return
 		}
 		cur.Sanitize()
-		h.storeControlSetting(c, ctx, database.SettingKeyBilling, cur)
+		if err := h.storeControlSetting(c, ctx, database.SettingKeyBilling, cur); err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		// 数据面计费配置缓存立即失效（否则最多滞后 walletConfigCacheTTL）。
+		h.invalidateBillingConfigCache()
+		c.JSON(http.StatusOK, gin.H{"key": database.SettingKeyBilling, "value": cur})
 		return
 	case controlSettingSectionSMTP:
 		cur, err := h.db.LoadSMTPConfig(ctx)
@@ -114,7 +120,11 @@ func (h *Handler) UpdateControlSettingsSection(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, msg)
 			return
 		}
-		h.storeControlSetting(c, ctx, database.SettingKeySMTP, cur)
+		if err := h.storeControlSetting(c, ctx, database.SettingKeySMTP, cur); err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"key": database.SettingKeySMTP, "value": cur})
 		return
 	case controlSettingSectionEpay:
 		cur, err := h.db.LoadEpayConfig(ctx)
@@ -130,7 +140,11 @@ func (h *Handler) UpdateControlSettingsSection(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, msg)
 			return
 		}
-		h.storeControlSetting(c, ctx, database.SettingKeyEpay, cur)
+		if err := h.storeControlSetting(c, ctx, database.SettingKeyEpay, cur); err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"key": database.SettingKeyEpay, "value": cur})
 		return
 	case controlSettingSectionTurnstile:
 		cur, err := h.db.LoadTurnstileConfig(ctx)
@@ -146,7 +160,11 @@ func (h *Handler) UpdateControlSettingsSection(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, msg)
 			return
 		}
-		h.storeControlSetting(c, ctx, database.SettingKeyTurnstile, cur)
+		if err := h.storeControlSetting(c, ctx, database.SettingKeyTurnstile, cur); err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"key": database.SettingKeyTurnstile, "value": cur})
 		return
 	case controlSettingSectionGeoIP:
 		cur, err := h.db.LoadGeoIPConfig(ctx)
@@ -163,7 +181,11 @@ func (h *Handler) UpdateControlSettingsSection(c *gin.Context) {
 			return
 		}
 		cur.Sanitize()
-		h.storeControlSetting(c, ctx, database.SettingKeyGeoIP, cur)
+		if err := h.storeControlSetting(c, ctx, database.SettingKeyGeoIP, cur); err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"key": database.SettingKeyGeoIP, "value": cur})
 		return
 	default:
 		writeError(c, http.StatusBadRequest, "未知配置段: "+section)
@@ -171,18 +193,16 @@ func (h *Handler) UpdateControlSettingsSection(c *gin.Context) {
 	}
 }
 
-// storeControlSetting 序列化并写入配置段，随后返回更新后的值。
-func (h *Handler) storeControlSetting(c *gin.Context, ctx context.Context, key string, value interface{}) {
+// storeControlSetting 序列化并写入配置段；返回错误由调用方统一处理响应。
+func (h *Handler) storeControlSetting(c *gin.Context, ctx context.Context, key string, value interface{}) error {
 	raw, err := json.Marshal(value)
 	if err != nil {
-		writeInternalError(c, err)
-		return
+		return err
 	}
 	if err := h.db.SetSettingValue(ctx, key, string(raw), 0); err != nil {
-		writeInternalError(c, err)
-		return
+		return err
 	}
-	c.JSON(http.StatusOK, gin.H{"key": key, "value": value})
+	return nil
 }
 
 // TestSMTPConnection POST /api/admin/control-settings/smtp/test
@@ -236,6 +256,10 @@ func validateBillingConfig(cfg *database.BillingConfig) string {
 	}
 	if cfg.MinChargeMicro < 0 {
 		return "min_charge_micro 不能为负"
+	}
+	// 预留必须能覆盖最小扣费；否则结算兜底会把实扣封顶在预留额，用户实付低于预期最低价。
+	if cfg.DepositMicro < cfg.MinChargeMicro {
+		return "deposit_micro 不能小于 min_charge_micro"
 	}
 	if cfg.ChargeCapMicro != 0 && cfg.ChargeCapMicro < cfg.MinChargeMicro {
 		return "charge_cap_micro 不能小于 min_charge_micro（0 表示不封顶）"

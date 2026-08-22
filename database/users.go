@@ -264,15 +264,16 @@ func scanUser(row interface{ Scan(...interface{}) error }) (*User, error) {
 	return &u, nil
 }
 
-// SetUserEmailVerified 标记邮箱已验证并把状态置为 active（保留首次验证时间）。
+// SetUserEmailVerified 标记邮箱已验证（保留首次验证时间）。仅把 pending 用户置为
+// active：被封禁/已激活用户保持原状态，防止封禁用户凭未使用验证 token 自解封。
 func (db *DB) SetUserEmailVerified(ctx context.Context, userID int64) error {
 	_, err := db.conn.ExecContext(ctx, `
 		UPDATE users
 		SET email_verified_at = COALESCE(email_verified_at, $1),
-		    status            = $2,
+		    status            = CASE WHEN status = $2 THEN $3 ELSE status END,
 		    updated_at        = $1
-		WHERE id = $3`,
-		db.timeArg(time.Now().UTC()), UserStatusActive, userID)
+		WHERE id = $4`,
+		db.timeArg(time.Now().UTC()), UserStatusPending, UserStatusActive, userID)
 	return err
 }
 
@@ -529,7 +530,8 @@ func (db *DB) tokenFailureReason(ctx context.Context, table, tokenHash string) e
 		return ErrTokenUsed
 	}
 	expires := decodeTimeValue(expiresRaw)
-	if !expires.IsZero() && expires.Before(time.Now()) {
+	// 统一用 UTC 与 DB 存储时间比较，避免非 UTC 服务器误报「已过期」。
+	if !expires.IsZero() && expires.Before(time.Now().UTC()) {
 		return ErrTokenExpired
 	}
 	return ErrTokenNotFound

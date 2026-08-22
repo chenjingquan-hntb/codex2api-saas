@@ -337,3 +337,50 @@ func mustHash(t *testing.T, password string) string {
 	}
 	return h
 }
+
+// TestSetUserEmailVerifiedPreservesBannedStatus 校验邮箱验证不会把封禁用户解封
+// （封禁只能由管理员恢复，验证 token 不能绕过）。
+func TestSetUserEmailVerifiedPreservesBannedStatus(t *testing.T) {
+	db := newUsersTestDB(t)
+	ctx := context.Background()
+
+	user, err := db.CreateUser(ctx, "banned-verify@test.dev", "x")
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if user.Status != UserStatusPending {
+		t.Fatalf("new user status = %s, want pending", user.Status)
+	}
+	if err := db.UpdateUserStatus(ctx, user.ID, UserStatusBanned); err != nil {
+		t.Fatalf("ban: %v", err)
+	}
+	if err := db.SetUserEmailVerified(ctx, user.ID); err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	after, err := db.GetUserByID(ctx, user.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if after.Status != UserStatusBanned {
+		t.Fatalf("banned user was un-banned by email verification: status=%s", after.Status)
+	}
+	if !after.EmailVerified() {
+		t.Fatal("email should still be marked verified")
+	}
+
+	// 正常 pending 用户验证后进入 active（回归）。
+	user2, err := db.CreateUser(ctx, "normal-verify@test.dev", "x")
+	if err != nil {
+		t.Fatalf("create user2: %v", err)
+	}
+	if err := db.SetUserEmailVerified(ctx, user2.ID); err != nil {
+		t.Fatalf("verify user2: %v", err)
+	}
+	after2, err := db.GetUserByID(ctx, user2.ID)
+	if err != nil {
+		t.Fatalf("get user2: %v", err)
+	}
+	if after2.Status != UserStatusActive {
+		t.Fatalf("pending user verify status = %s, want active", after2.Status)
+	}
+}

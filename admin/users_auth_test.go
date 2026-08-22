@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -334,5 +335,61 @@ func TestKeyedRateLimiter(t *testing.T) {
 	}
 	if !l.allow("ip-1", now.Add(time.Minute+time.Second)) {
 		t.Fatal("window expiry should free quota")
+	}
+}
+
+// TestKeyedRateLimiterGC 校验窗口级 GC：未被复用的过期 key 被清理，map 不会无界增长。
+func TestKeyedRateLimiterGC(t *testing.T) {
+	l := newKeyedRateLimiter(5, time.Minute)
+	now := time.Now()
+	if !l.allow("stale-ip", now) {
+		t.Fatal("first allow should pass")
+	}
+	// 窗口推进超过一个 win，另一个 key 触发 GC：stale-ip 已过期且未被复用 → 被删除。
+	if !l.allow("active-ip", now.Add(2*time.Minute)) {
+		t.Fatal("second allow should pass")
+	}
+	if _, ok := l.hits["stale-ip"]; ok {
+		t.Fatal("expired unused key must be garbage collected")
+	}
+	if _, ok := l.hits["active-ip"]; !ok {
+		t.Fatal("active key must survive gc")
+	}
+	// 窗口内已命中条目保留、旧命中被剪除。
+	if !l.allow("active-ip", now.Add(2*time.Minute)) {
+		t.Fatal("within-window hit should pass")
+	}
+	if got := len(l.hits["active-ip"]); got != 2 {
+		t.Fatalf("active key hits = %d, want 2", got)
+	}
+}
+
+// TestUserVerifyEmailBannedRejected 校验封禁用户无法通过验证自解封（403，状态保持封禁）。
+func TestUserVerifyEmailBannedRejected(t *testing.T) {
+	h, db := newUserAuthTestHandler(t)
+	email := "banned-verify@example.com"
+	password := "S3curePass!123"
+	userID, verifyToken := registerUser(t, h, email, password)
+
+	// 管理员封禁（目前无管理端点，直接走 DB 服务层模拟）。
+	if err := db.UpdateUserStatus(context.Background(), int64(userID), database.UserStatusBanned); err != nil {
+		t.Fatalf("ban: %v", err)
+	}
+	rec := doJSON(t, h, http.MethodPost, "/api/auth/verify-email",
+		fmt.Sprintf(`{"token":%q}`, verifyToken), nil)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("verify banned status = %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	user, err := db.GetUserByID(context.Background(), int64(userID))
+	if err != nil {
+		t.Fatalf("get user: %v", err)
+	}
+	if user.Status != database.UserStatusBanned {
+		t.Fatalf("banned user status changed to %s", user.Status)
+	}
+	// 未验证（登录应仍被拒）。
+	rec = loginUser(t, h, email, password)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("banned login status = %d, want 403", rec.Code)
 	}
 }

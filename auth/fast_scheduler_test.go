@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"github.com/codex2api/database"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -1350,5 +1351,34 @@ func TestStoreAPIKeyAllowsConfiguredNoAffinityGroups(t *testing.T) {
 	}
 	if store.APIKeyAllowsAccount(1, other) {
 		t.Fatal("unconfigured group should remain unauthorized")
+	}
+}
+
+func TestStoreAPIKeyUpstreamChannelIsolatesAnthropicAccounts(t *testing.T) {
+	codex := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
+	grok := newFastSchedulerTestAccount(2, HealthTierHealthy, 100, 1)
+	grok.UpstreamType = UpstreamGrok
+	grok.APIKey = "xai-test"
+	anthropic := newFastSchedulerTestAccount(3, HealthTierHealthy, 100, 1)
+	anthropic.UpstreamType = UpstreamAnthropic
+	anthropic.APIKey = "sk-ant-test"
+
+	store := &Store{accounts: []*Account{codex, grok, anthropic}, maxConcurrency: 1}
+	store.rebuildAccountIndex()
+
+	store.SetAPIKeyUpstreamChannel(1, database.UpstreamChannelAnthropic)
+	if !store.APIKeyAllowsAccount(1, anthropic) {
+		t.Fatal("anthropic channel should allow native Anthropic account")
+	}
+	if store.APIKeyAllowsAccount(1, codex) || store.APIKeyAllowsAccount(1, grok) {
+		t.Fatal("anthropic channel must reject Codex and Grok accounts")
+	}
+
+	store.SetAPIKeyUpstreamChannel(2, database.UpstreamChannelCodex)
+	if !store.APIKeyAllowsAccount(2, codex) {
+		t.Fatal("codex channel should allow Codex account")
+	}
+	if store.APIKeyAllowsAccount(2, grok) || store.APIKeyAllowsAccount(2, anthropic) {
+		t.Fatal("codex channel must reject Grok and Anthropic accounts")
 	}
 }

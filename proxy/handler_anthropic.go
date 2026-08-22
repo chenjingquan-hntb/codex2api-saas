@@ -205,12 +205,19 @@ func (h *Handler) Messages(c *gin.Context) {
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 
 	// 2. 选号前只解析模型/effort/tier，不把整段 Messages 转成有损 Codex 体。
-	// Grok 账号选中后再走一次 TranslateAnthropicToResponsesForGrok；
-	// Codex / OpenAI 中转仍按需翻译成 Codex-safe Responses。
+	// Anthropic API Key 渠道必须保留真实 Claude 模型名和原始 Messages JSON；
+	// 其它渠道继续沿用既有 Claude→Codex/Grok 路由映射。
 	supportedModels := h.supportedModelIDs(c.Request.Context())
+	upstreamChannel := requestUpstreamChannel(c)
 	routingBody := h.resolveMessagesRoutingBody(rawBody, model, supportedModels)
+	if upstreamChannel == database.UpstreamChannelAnthropic {
+		routingBody = rawBody
+	}
 	originalModel := model
 	effectiveModel := effectiveRequestModel(routingBody, model)
+	if upstreamChannel == database.UpstreamChannelAnthropic {
+		effectiveModel = model
+	}
 	if isMediaOnlyModel(effectiveModel) {
 		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on %s", effectiveModel, mediaOnlyModelEndpoints(effectiveModel)))
 		return
@@ -290,6 +297,151 @@ func (h *Handler) Messages(c *gin.Context) {
 		if wsHTTPFallback.ForceHTTP() {
 			log.Printf("上游 WebSocket 1009 后启动 HTTP 降级尝试 (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/messages, ws_elapsed_ms=%d)", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsHTTPFallback.WSElapsed().Milliseconds())
 		}
+		if account.IsAnthropicAPI() {
+			if lastUpstreamCancel != nil {
+				lastUpstreamCancel()
+			}
+			upstreamCtx, upstreamCancel := newDrainableUpstreamContext(c.Request.Context(), upstreamDrainTimeout)
+			attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
+			upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
+			lastUpstreamCancel = upstreamCancel
+			ttftGuard := newFirstTokenTimeoutGuard(currentFirstTokenTimeout(), upstreamCancel)
+			resp, reqErr := ExecuteAnthropicMessagesRequest(upstreamCtx, account, rawBody, proxyURL, c.Request.Header.Clone())
+			durationMs := int(time.Since(start).Milliseconds())
+			if reqErr != nil {
+				timedOut := ttftGuard.TimedOut()
+				ttftGuard.Stop()
+				if timedOut {
+					reqErr = firstTokenTimeoutError(currentFirstTokenTimeout())
+				}
+				kind := classifyTransportFailure(reqErr)
+				retryable := IsRetryableError(reqErr) || kind != ""
+				shouldRetry := retryable && shouldRetryRequestError(reqErr, &generalRetries, maxRetries)
+				if shouldPenalizeTransportKind(kind) && !(timedOut && shouldRetry) {
+					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				}
+				h.logUsageForRequest(c, &database.UsageLogInput{
+					AccountID: account.ID(), Channel: database.UpstreamChannelAnthropic,
+					Endpoint: "/v1/messages", InboundEndpoint: "/v1/messages", UpstreamEndpoint: "/v1/messages",
+					Model: model, EffectiveModel: model, StatusCode: logStatusUpstreamStreamBreak,
+					DurationMs: durationMs, Stream: isStream, IsRetryAttempt: shouldRetry, AttemptIndex: attempt + 1,
+					UpstreamErrorKind: kind, ErrorMessage: usageLogFailureMessage(logStatusUpstreamStreamBreak, reqErr.Error()),
+				})
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				if timedOut && shouldRetry {
+					retryExclusions.MarkSoftFirstTokenTimeout(account.ID())
+					continue
+				}
+				retryExclusions.MarkHard(account.ID())
+				if shouldRetry {
+					continue
+				}
+				sendAnthropicError(c, http.StatusBadGateway, "api_error", "Anthropic upstream request failed")
+				return
+			}
+			if resp.StatusCode != http.StatusOK {
+				ttftGuard.Stop()
+				errBody, readErr := readAllLimited(resp.Body, upstreamErrorBodyReadMaxBytes)
+				if readErr != nil {
+					errBody = []byte(`{"type":"error","error":{"type":"api_error","message":"Anthropic upstream error response exceeded the safe read limit"}}`)
+				}
+				status := resp.StatusCode
+				decision := h.applyCooldownForModel(account, status, errBody, resp, model)
+				kind := upstreamErrorKind(status, errBody, decision)
+				if kind != "" {
+					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				}
+				shouldRetry := shouldRetryHTTPStatus(status, errBody, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+				h.logUsageForRequest(c, &database.UsageLogInput{
+					AccountID: account.ID(), Channel: database.UpstreamChannelAnthropic,
+					Endpoint: "/v1/messages", InboundEndpoint: "/v1/messages", UpstreamEndpoint: "/v1/messages",
+					Model: model, EffectiveModel: model, StatusCode: status, DurationMs: durationMs,
+					Stream: isStream, IsRetryAttempt: shouldRetry, AttemptIndex: attempt + 1,
+					UpstreamErrorKind: kind, ErrorMessage: usageLogErrorMessage(status, errBody),
+				})
+				resp.Body.Close()
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				retryExclusions.MarkHard(account.ID())
+				if shouldRetry {
+					lastStatusCode = status
+					lastBody = errBody
+					continue
+				}
+				if status == http.StatusUnauthorized || status == http.StatusForbidden {
+					sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", "Anthropic account pool has no usable credentials; please retry later")
+					return
+				}
+				sendAnthropicError(c, status, mapHTTPStatusToAnthropicError(status), anthropicErrorMessage(errBody))
+				return
+			}
+			forward := forwardAnthropicDirectResponse(c, resp, isStream, start, ttftGuard.Stop)
+			ttftGuard.Stop()
+			resp.Body.Close()
+
+			shouldRetry := shouldTransparentRetryStream(forward.outcome, attempt, maxRetries, forward.wroteBody, c.Request.Context().Err(), forward.writeErr)
+			logInput := &database.UsageLogInput{
+				AccountID: account.ID(), Channel: database.UpstreamChannelAnthropic,
+				Endpoint: "/v1/messages", InboundEndpoint: "/v1/messages", UpstreamEndpoint: "/v1/messages",
+				Model: model, EffectiveModel: model, StatusCode: forward.outcome.logStatusCode,
+				DurationMs: forward.durationMs, FirstTokenMs: forward.firstTokenMs, Stream: isStream,
+				IsRetryAttempt: shouldRetry, AttemptIndex: attempt + 1,
+			}
+			if forward.usage != nil {
+				logInput.PromptTokens = forward.usage.PromptTokens
+				logInput.CompletionTokens = forward.usage.CompletionTokens
+				logInput.TotalTokens = forward.usage.TotalTokens
+				logInput.InputTokens = forward.usage.InputTokens
+				logInput.OutputTokens = forward.usage.OutputTokens
+				logInput.ReasoningTokens = forward.usage.ReasoningTokens
+				logInput.CachedTokens = forward.usage.CachedTokens
+			}
+			if forward.outcome.logStatusCode != http.StatusOK {
+				logInput.UpstreamErrorKind = forward.outcome.failureKind
+				logInput.ErrorMessage = usageLogFailureMessage(forward.outcome.logStatusCode, forward.outcome.failureMessage)
+			}
+			h.logUsageForRequest(c, logInput)
+
+			if shouldRetry {
+				if forward.outcome.penalize {
+					h.reportStreamOutcomeFailure(account, forward.outcome, time.Duration(forward.durationMs)*time.Millisecond)
+				}
+				h.store.Release(account)
+				h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				retryExclusions.MarkHard(account.ID())
+				recyclePooledClient(account, proxyURL)
+				continue
+			}
+			if forward.outcome.logStatusCode == http.StatusOK {
+				h.store.ClearModelCooldown(account, model)
+				h.store.ReportRequestSuccess(account, time.Duration(forward.durationMs)*time.Millisecond)
+			} else {
+				if forward.outcome.penalize {
+					h.reportStreamOutcomeFailure(account, forward.outcome, time.Duration(forward.durationMs)*time.Millisecond)
+				}
+				if forward.outcome.logStatusCode != logStatusClientClosed {
+					h.store.UnbindSessionAffinity(affinityKey, account.ID())
+				}
+				if !forward.wroteBody && c.Request.Context().Err() == nil && forward.writeErr == nil {
+					status := forward.outcome.logStatusCode
+					if status < 400 || status > 599 || status == logStatusUpstreamStreamBreak || status == logStatusClientClosed {
+						status = http.StatusBadGateway
+					}
+					if status == http.StatusUnauthorized || status == http.StatusForbidden {
+						status = http.StatusServiceUnavailable
+					}
+					message := strings.TrimSpace(forward.outcome.failureMessage)
+					if message == "" {
+						message = "Anthropic upstream response failed"
+					}
+					sendAnthropicError(c, status, mapHTTPStatusToAnthropicError(status), message)
+				}
+			}
+			h.store.Release(account)
+			return
+		}
+
 		isRelayAccount := account.IsRelayStyle()
 		attemptEffectiveModel := effectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount

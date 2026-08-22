@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 )
 
@@ -252,15 +253,17 @@ type walletApply struct {
 
 // walletApplyTx 在给定事务内施加一次钱包变动并写一条不可变账本。
 //
-// 幂等实现：先条件更新余额，再以 idempotency_key 唯一约束插入账本；若键已存在
-// （RowsAffected==0）说明是重放，返回 errWalletReplay，由 withWriteTx 回滚本次
-// 事务撤销刚做的余额变动，从而保证重放绝不重复扣款。
+// 幂等实现：先条件更新余额，再以 (user_id, idempotency_key) 唯一约束插入账本；
+// 若键已存在（RowsAffected==0）说明是重放，返回 errWalletReplay，由 withWriteTx
+// 回滚本次事务撤销刚做的余额变动，从而保证重放绝不重复扣款。
+// 幂等键按用户维度唯一（复合唯一索引），同一键在不同用户下互不冲突。
 func (db *DB) walletApplyTx(ctx context.Context, tx *sql.Tx, a walletApply) error {
 	// 先查幂等键：已存在则直接判定为重放，避免在余额已被上次操作变更后
 	// 触发“余额/预留不足”误判。并发竞争仍由下面的唯一约束 + 回滚兜底。
 	var one int
 	err := tx.QueryRowContext(ctx, `
-		SELECT 1 FROM wallet_ledger_entries WHERE idempotency_key = $1`, a.IdempotencyKey).Scan(&one)
+		SELECT 1 FROM wallet_ledger_entries WHERE user_id = $1 AND idempotency_key = $2`,
+		a.UserID, a.IdempotencyKey).Scan(&one)
 	switch {
 	case err == nil:
 		return errWalletReplay
@@ -310,7 +313,7 @@ func (db *DB) walletApplyTx(ctx context.Context, tx *sql.Tx, a walletApply) erro
 			(user_id, type, amount_micro, balance_before_micro, balance_after_micro,
 			 reference_type, reference_id, idempotency_key, operator_id, reason)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		ON CONFLICT (idempotency_key) DO NOTHING`,
+		ON CONFLICT (user_id, idempotency_key) DO NOTHING`,
 		a.UserID, string(a.Type), a.AmountMicro, balanceBefore, balanceAfter,
 		a.RefType, a.RefID, a.IdempotencyKey, a.OperatorID, a.Reason)
 	if err != nil {
@@ -345,6 +348,97 @@ func (db *DB) ensureWalletAccountTx(ctx context.Context, tx *sql.Tx, userID int6
 		VALUES ($1, 'CNY', 0, 0)
 		ON CONFLICT (user_id) DO NOTHING`, userID)
 	return err
+}
+
+// ReconcileOrphanedWalletReservations 释放「孤儿预留」：超过 olderThan 仍没有对应
+// release/consume（结算或释放）的 reserve 条目。
+//
+// 背景：数据面在请求开始预留、请求收尾结算/释放；若进程在预留后崩溃、或收尾时
+// 钱包 DB 持续故障，reserved_micro 会永久占用、available 永久减少。本函数按
+// reference_type='request' + reference_id 配对，找出未收尾的预留并整批恢复。
+// 恢复动作本身也是一条 release 账本（refType=orphan_recovery，幂等键 recover:<id>），
+// 保持账本可重算与不变量；重复对账由幂等键哨兵幂等跳过。
+// limit 限制单批处理条数（防一次扫全表）；返回恢复条数与释放的微元总数。
+func (db *DB) ReconcileOrphanedWalletReservations(ctx context.Context, olderThan time.Duration, limit int) (int, int64, error) {
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	if olderThan <= 0 {
+		olderThan = 24 * time.Hour
+	}
+	cutoff := time.Now().UTC().Add(-olderThan)
+
+	var recovered int
+	var recoveredMicro int64
+	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `
+			SELECT l.id, l.user_id, l.amount_micro
+			FROM wallet_ledger_entries l
+			WHERE l.type = 'reserve'
+			  AND l.reference_type = 'request'
+			  AND l.created_at < $1
+			  AND NOT EXISTS (
+				SELECT 1 FROM wallet_ledger_entries p
+				WHERE p.type IN ('release', 'consume')
+				  AND (
+					(p.reference_type = l.reference_type AND p.reference_id = l.reference_id)
+					OR (p.reference_type = 'orphan_recovery' AND p.reference_id = CAST(l.id AS TEXT))
+				  )
+			  )
+			LIMIT $2`, db.timeArg(cutoff), limit)
+		if err != nil {
+			return err
+		}
+		type orphan struct {
+			id, userID  int64
+			amountMicro int64 // 账本里的 reserve 金额为负
+		}
+		var orphans []orphan
+		for rows.Next() {
+			var o orphan
+			if err := rows.Scan(&o.id, &o.userID, &o.amountMicro); err != nil {
+				rows.Close()
+				return err
+			}
+			orphans = append(orphans, o)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, o := range orphans {
+			amount := -o.amountMicro // reserve 记负额，恢复为正向释放
+			if amount <= 0 {
+				continue
+			}
+			// 复用统一 walletApplyTx：条件更新 + 账本不变量 + 幂等键兜底。
+			if err := db.walletApplyTx(ctx, tx, walletApply{
+				UserID:          o.userID,
+				Type:            WalletTxRelease,
+				AmountMicro:     amount,
+				DeltaAvailable:  amount,
+				DeltaReserved:   -amount,
+				RefType:         "orphan_recovery",
+				RefID:           strconv.FormatInt(o.id, 10),
+				IdempotencyKey:  "recover:" + strconv.FormatInt(o.id, 10),
+				InsufficientErr: ErrInsufficientReserved,
+				Reason:          "orphan reservation auto-recovered",
+			}); err != nil {
+				// 已被并发对账处理（幂等重放）则跳过；其余错误终止本轮（整批回滚重试）。
+				if errors.Is(err, errWalletReplay) {
+					continue
+				}
+				return err
+			}
+			recovered++
+			recoveredMicro += amount
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return recovered, recoveredMicro, nil
 }
 
 // decodeTimeValue 把数据库返回的时间值解码为 time.Time（兼容 SQLite 字符串与 PG time.Time）。

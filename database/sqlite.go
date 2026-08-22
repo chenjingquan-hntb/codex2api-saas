@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"net/url"
 	"sort"
 	"strings"
@@ -521,10 +522,11 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			balance_after_micro INTEGER NOT NULL,
 			reference_type TEXT DEFAULT '',
 			reference_id TEXT DEFAULT '',
-			idempotency_key TEXT NOT NULL UNIQUE,
+			idempotency_key TEXT NOT NULL,
 			operator_id INTEGER DEFAULT 0,
 			reason TEXT DEFAULT '',
-			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(user_id, idempotency_key)
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user_created ON wallet_ledger_entries(user_id, created_at);`,
 		`CREATE TABLE IF NOT EXISTS wallet_transactions (
@@ -865,7 +867,106 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		return err
 	}
 
+	if err := db.rebuildWalletLedgerIdempotencySQLite(ctx); err != nil {
+		return err
+	}
+
 	return db.runDataMigrationsWithTimeout()
+}
+
+// rebuildWalletLedgerIdempotencySQLite 把旧版 wallet_ledger_entries 的单列
+// idempotency_key UNIQUE（autoindex）迁移为 (user_id, idempotency_key) 复合唯一。
+// SQLite 无法直接删除列级 UNIQUE 自动索引，只能重建表；新库直接走新 DDL 不触发。
+func (db *DB) rebuildWalletLedgerIdempotencySQLite(ctx context.Context) error {
+	tables, err := db.sqliteTableColumns(ctx, "wallet_ledger_entries")
+	if err != nil {
+		return err
+	}
+	if len(tables) == 0 {
+		return nil // 表不存在（新库会在上方 CREATE TABLE 直接建复合唯一）
+	}
+	rows, err := db.conn.QueryContext(ctx, `PRAGMA index_list('wallet_ledger_entries')`)
+	if err != nil {
+		return err
+	}
+	// 先完整消费并关闭 index_list 结果集，再逐索引查 index_info；
+	// 否则单连接（:memory:）下内层查询会因连接被占用而互相等待。
+	var uniqueIndexes []string
+	for rows.Next() {
+		var seq int
+		var name string
+		var unique, partial int
+		var origin string
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			rows.Close()
+			return err
+		}
+		// origin='u' 表示 UNIQUE 约束产生的 autoindex；列级单列唯一（旧 schema）
+		// 与表级复合唯一（新 schema）都会是 'u'，下一步用 index_info 列数区分。
+		if origin == "u" {
+			uniqueIndexes = append(uniqueIndexes, name)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	needsRebuild := false
+	for _, name := range uniqueIndexes {
+		infoRows, err := db.conn.QueryContext(ctx, fmt.Sprintf(`PRAGMA index_info(%q)`, name))
+		if err != nil {
+			return err
+		}
+		cols := 0
+		for infoRows.Next() {
+			cols++
+		}
+		infoRows.Close()
+		if err := infoRows.Err(); err != nil {
+			return err
+		}
+		// 只有 1 列（idempotency_key）→ 旧 schema，需要重建。
+		if cols == 1 {
+			needsRebuild = true
+		}
+	}
+	if !needsRebuild {
+		return nil
+	}
+
+	rebuild := []string{
+		`CREATE TABLE wallet_ledger_entries_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			type TEXT NOT NULL,
+			amount_micro INTEGER NOT NULL,
+			balance_before_micro INTEGER NOT NULL,
+			balance_after_micro INTEGER NOT NULL,
+			reference_type TEXT DEFAULT '',
+			reference_id TEXT DEFAULT '',
+			idempotency_key TEXT NOT NULL,
+			operator_id INTEGER DEFAULT 0,
+			reason TEXT DEFAULT '',
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(user_id, idempotency_key)
+		);`,
+		`INSERT INTO wallet_ledger_entries_new
+			(id, user_id, type, amount_micro, balance_before_micro, balance_after_micro,
+			 reference_type, reference_id, idempotency_key, operator_id, reason, created_at)
+		SELECT id, user_id, type, amount_micro, balance_before_micro, balance_after_micro,
+		       reference_type, reference_id, idempotency_key, operator_id, reason, created_at
+		FROM wallet_ledger_entries;`,
+		`DROP TABLE wallet_ledger_entries;`,
+		`ALTER TABLE wallet_ledger_entries_new RENAME TO wallet_ledger_entries;`,
+		`CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user_created ON wallet_ledger_entries(user_id, created_at);`,
+	}
+	for _, stmt := range rebuild {
+		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("重建 wallet_ledger_entries 失败: %w", err)
+		}
+	}
+	log.Printf("wallet_ledger_entries 已从单列幂等键迁移为 (user_id, idempotency_key) 复合唯一")
+	return nil
 }
 
 func (db *DB) ensureSQLiteColumn(ctx context.Context, table string, name string, columnDef string) error {

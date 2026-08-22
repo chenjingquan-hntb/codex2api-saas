@@ -89,6 +89,7 @@ type Handler struct {
 	loginEmailLimiter         *keyedRateLimiter
 	resendLimiter             *keyedRateLimiter
 	resetReqLimiter           *keyedRateLimiter
+	invalidateWalletCfgCache  func() // 数据面计费配置缓存失效（main.go 注入 proxy.Handler）
 	imageProxy                *proxy.Handler
 
 	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
@@ -912,13 +913,15 @@ func (h *Handler) getUsageStatsSummaryCached(ctx context.Context, rangeStart, ra
 	return stats, nil
 }
 
-// parseUsageChannel 解析 query 里的渠道过滤参数（codex/grok，其余视为不限）。
+// parseUsageChannel 解析 query 里的渠道过滤参数（codex/grok/anthropic，其余视为不限）。
 func parseUsageChannel(c *gin.Context) string {
 	switch strings.ToLower(strings.TrimSpace(c.Query("channel"))) {
 	case database.UpstreamChannelCodex:
 		return database.UpstreamChannelCodex
 	case database.UpstreamChannelGrok:
 		return database.UpstreamChannelGrok
+	case database.UpstreamChannelAnthropic:
+		return database.UpstreamChannelAnthropic
 	}
 	return ""
 }
@@ -971,6 +974,22 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		}
 	}
 	return handler
+}
+
+// SetWalletConfigInvalidator 注入数据面计费配置缓存失效回调（main.go 在创建 proxy.Handler 后调用）。
+func (h *Handler) SetWalletConfigInvalidator(fn func()) {
+	if h == nil {
+		return
+	}
+	h.invalidateWalletCfgCache = fn
+}
+
+// invalidateBillingConfigCache 触发数据面计费配置缓存失效（PUT /control-settings/billing 后）。
+func (h *Handler) invalidateBillingConfigCache() {
+	if h == nil || h.invalidateWalletCfgCache == nil {
+		return
+	}
+	h.invalidateWalletCfgCache()
 }
 
 // SetPoolSizes 设置连接池大小跟踪值（由 main.go 在启动时调用）
@@ -1048,6 +1067,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/codex/agent-identity", h.ImportCodexAgentIdentity)
 	api.POST("/accounts/codex/agent-identity/import", h.BatchImportCodexAgentIdentity)
 	api.POST("/accounts/openai-responses", h.AddOpenAIResponsesAccount)
+	api.POST("/accounts/anthropic", h.AddAnthropicAccount)
 	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
 	api.POST("/accounts/grok", h.AddGrokAccount)
@@ -1367,8 +1387,9 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 
 	var counts dashboardAccountCounts
 	channelCounts := map[string]dashboardAccountCounts{
-		database.UpstreamChannelCodex: {},
-		database.UpstreamChannelGrok:  {},
+		database.UpstreamChannelCodex:     {},
+		database.UpstreamChannelGrok:      {},
+		database.UpstreamChannelAnthropic: {},
 	}
 	counts.total = len(rows)
 	for _, row := range rows {
@@ -1378,8 +1399,11 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 		status := strings.ToLower(strings.TrimSpace(row.Status))
 		cooldownReason := strings.ToLower(strings.TrimSpace(row.CooldownReason))
 		channel := database.UpstreamChannelCodex
-		if strings.EqualFold(strings.TrimSpace(row.GetCredential("upstream_type")), auth.UpstreamGrok) {
+		switch strings.ToLower(strings.TrimSpace(row.GetCredential("upstream_type"))) {
+		case auth.UpstreamGrok:
 			channel = database.UpstreamChannelGrok
+		case auth.UpstreamAnthropic:
+			channel = database.UpstreamChannelAnthropic
 		}
 		usingCredits := false
 		acc := runtimeByID[row.ID]
@@ -1390,6 +1414,8 @@ func summarizeDashboardAccounts(rows []*database.AccountRow, runtimeAccounts []*
 			usingCredits = acc.UsingCredits()
 			if acc.IsGrokAPI() {
 				channel = database.UpstreamChannelGrok
+			} else if acc.IsAnthropicAPI() {
+				channel = database.UpstreamChannelAnthropic
 			}
 		}
 		perChannel := channelCounts[channel]
@@ -1423,7 +1449,7 @@ func isDashboardAbnormalAccount(status string) bool {
 
 func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bool {
 	if acc != nil {
-		if acc.IsGrokAPI() || acc.IsOpenAIResponsesAPI() {
+		if acc.IsGrokAPI() || acc.IsOpenAIResponsesAPI() || acc.IsAnthropicAPI() {
 			return false
 		}
 		snapshot := acc.GetAccountListRuntimeSnapshot()
@@ -1437,7 +1463,7 @@ func isDashboardUnsampledAccount(row *database.AccountRow, acc *auth.Account) bo
 		return false
 	}
 	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
-	if strings.EqualFold(upstreamType, auth.UpstreamGrok) || strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses) {
+	if strings.EqualFold(upstreamType, auth.UpstreamGrok) || strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses) || strings.EqualFold(upstreamType, auth.UpstreamAnthropic) {
 		return false
 	}
 	status := strings.ToLower(strings.TrimSpace(row.Status))
@@ -1485,6 +1511,7 @@ type accountResponse struct {
 	AccountType                   string                      `json:"account_type,omitempty"`
 	AccessTokenType               string                      `json:"access_token_type,omitempty"`
 	OpenAIResponsesAPI            bool                        `json:"openai_responses_api,omitempty"`
+	AnthropicAPI                  bool                        `json:"anthropic_api,omitempty"`
 	GrokAPI                       bool                        `json:"grok_api,omitempty"`
 	AgentIdentity                 bool                        `json:"agent_identity,omitempty"`
 	GrokAuthKind                  string                      `json:"grok_auth_kind,omitempty"`
@@ -1857,6 +1884,7 @@ type accountLiteResponse struct {
 	ProxyURL           string `json:"proxy_url"`
 	ATOnly             bool   `json:"at_only"`
 	OpenAIResponsesAPI bool   `json:"openai_responses_api"`
+	AnthropicAPI       bool   `json:"anthropic_api"`
 	GrokAPI            bool   `json:"grok_api"`
 	AgentIdentity      bool   `json:"agent_identity"`
 	GrokAuthKind       string `json:"grok_auth_kind,omitempty"`
@@ -1881,6 +1909,7 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 		upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
 		isOpenAIResponsesAccount := strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses)
 		isGrokAccount := strings.EqualFold(upstreamType, auth.UpstreamGrok)
+		isAnthropicAccount := strings.EqualFold(upstreamType, auth.UpstreamAnthropic)
 		grokAuthKind := ""
 		if isGrokAccount {
 			if strings.TrimSpace(row.GetCredential("api_key")) != "" {
@@ -1890,11 +1919,11 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 			}
 		}
 		email := row.GetCredential("email")
-		if isOpenAIResponsesAccount && email == "" {
+		if (isOpenAIResponsesAccount || isAnthropicAccount) && email == "" {
 			email = row.GetCredential("base_url")
 		}
 		planType := row.GetCredential("plan_type")
-		if (isOpenAIResponsesAccount || (isGrokAccount && grokAuthKind == auth.GrokAuthKindAPIKey)) && planType == "" {
+		if (isOpenAIResponsesAccount || isAnthropicAccount || (isGrokAccount && grokAuthKind == auth.GrokAuthKindAPIKey)) && planType == "" {
 			planType = "api"
 		}
 		status := row.Status
@@ -1909,8 +1938,9 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 			Status:             status,
 			Enabled:            row.Enabled,
 			ProxyURL:           row.ProxyURL,
-			ATOnly:             !isOpenAIResponsesAccount && !isGrokAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
+			ATOnly:             !isOpenAIResponsesAccount && !isGrokAccount && !isAnthropicAccount && row.GetCredential("refresh_token") == "" && row.GetCredential("access_token") != "",
 			OpenAIResponsesAPI: isOpenAIResponsesAccount,
+			AnthropicAPI:       isAnthropicAccount,
 			GrokAPI:            isGrokAccount,
 			AgentIdentity:      isAgentIdentityCredentialRow(row),
 			GrokAuthKind:       grokAuthKind,
@@ -3614,6 +3644,85 @@ type fetchOpenAIResponsesModelsReq struct {
 	APIKey        string            `json:"api_key"`
 	ProxyURL      string            `json:"proxy_url"`
 	CustomHeaders map[string]string `json:"custom_headers"`
+}
+
+type addAnthropicAccountReq struct {
+	Name          string            `json:"name"`
+	BaseURL       string            `json:"base_url"`
+	APIKey        string            `json:"api_key"`
+	Models        []string          `json:"models"`
+	ProxyURL      string            `json:"proxy_url"`
+	CustomHeaders map[string]string `json:"custom_headers"`
+}
+
+// AddAnthropicAccount adds a native Anthropic Messages API-key account.
+func (h *Handler) AddAnthropicAccount(c *gin.Context) {
+	var req addAnthropicAccountReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	req.Name = security.SanitizeInput(req.Name)
+	req.BaseURL = strings.TrimRight(strings.TrimSpace(security.SanitizeInput(req.BaseURL)), "/")
+	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
+	req.APIKey = strings.TrimSpace(req.APIKey)
+	if req.APIKey == "" {
+		writeError(c, http.StatusBadRequest, "API Key 是必填字段")
+		return
+	}
+	if req.BaseURL == "" {
+		req.BaseURL = "https://api.anthropic.com"
+	}
+	if !strings.HasPrefix(strings.ToLower(req.BaseURL), "http://") && !strings.HasPrefix(strings.ToLower(req.BaseURL), "https://") {
+		writeError(c, http.StatusBadRequest, "Base URL 必须是 http 或 https 地址")
+		return
+	}
+	models := auth.NormalizeAccountModels(req.Models)
+	for _, model := range models {
+		if err := security.ValidateModelName(model); err != nil {
+			writeError(c, http.StatusBadRequest, fmt.Sprintf("模型名称无效: %s", model))
+			return
+		}
+	}
+	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
+		writeError(c, http.StatusBadRequest, "名称包含非法字符")
+		return
+	}
+	if utf8.RuneCountInString(req.Name) > 100 {
+		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
+		return
+	}
+	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
+		writeError(c, http.StatusBadRequest, "代理URL无效")
+		return
+	}
+	customHeaders, err := normalizeCustomHeaders(req.CustomHeaders)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	name := req.Name
+	if name == "" {
+		name = "anthropic"
+	}
+	credentials := map[string]interface{}{
+		"upstream_type": auth.UpstreamAnthropic, "base_url": req.BaseURL, "api_key": req.APIKey,
+		"models": models, "plan_type": "api", "email": req.BaseURL,
+	}
+	if len(customHeaders) > 0 {
+		credentials["custom_headers"] = cloneCustomHeaders(customHeaders)
+	}
+	id, err := h.db.InsertAccountWithUpstream(ctx, name, "anthropic", "api", credentials, req.ProxyURL)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	h.db.InsertAccountEventAsync(id, "added", "manual_anthropic")
+	h.store.AddAccount(&auth.Account{DBID: id, ProxyURL: req.ProxyURL, HealthTier: auth.HealthTierHealthy, UpstreamType: auth.UpstreamAnthropic, BaseURL: req.BaseURL, APIKey: req.APIKey, Models: models, CustomHeaders: customHeaders, Email: req.BaseURL, PlanType: "api"})
+	security.SecurityAuditLog("ANTHROPIC_ACCOUNT_ADDED", fmt.Sprintf("account_id=%d models=%d ip=%s", id, len(models), c.ClientIP()))
+	c.JSON(http.StatusOK, gin.H{"message": "成功添加 Anthropic API 账号", "id": id})
 }
 
 func (h *Handler) AddOpenAIResponsesAccount(c *gin.Context) {
@@ -5499,7 +5608,7 @@ type batchUpdateAccountsReq struct {
 
 func (h *Handler) accountOperationIdentity(id int64) (string, string) {
 	h.accountListCacheMu.RLock()
-	for _, channel := range []string{database.UpstreamChannelCodex, database.UpstreamChannelGrok} {
+	for _, channel := range []string{database.UpstreamChannelCodex, database.UpstreamChannelGrok, database.UpstreamChannelAnthropic} {
 		snapshot := h.accountListCache[channel]
 		if snapshot == nil {
 			continue

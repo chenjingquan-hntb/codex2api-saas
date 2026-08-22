@@ -131,7 +131,7 @@ interface LimitsFormState {
 }
 
 type ImageGenerationPolicy = "allow" | "strip" | "block";
-type UpstreamChannel = "auto" | "codex" | "grok";
+type UpstreamChannel = "auto" | "codex" | "grok" | "anthropic";
 
 // ScopeLimitFormState 是「该 Key × 某分组/账号」预算的一行表单（issue #439）。
 // 数值统一按字符串保存,空串表示不限,与其它限额字段一致。
@@ -359,6 +359,7 @@ export default function APIKeys() {
     (channel: UpstreamChannel): string[] => {
       if (channel === "grok") return grokModelOptions;
       if (channel === "codex") return modelOptions;
+      if (channel === "anthropic") return [];
       const seen = new Set(modelOptions.map((m) => m.toLowerCase()));
       return [
         ...modelOptions,
@@ -2470,7 +2471,7 @@ function limitsFromAPIKey(limits: APIKeyLimits | undefined): LimitsFormState {
     imageGenerationPolicy: resolveImageGenerationPolicy(limits),
     allowLive: Boolean(limits.allow_live),
     upstreamChannel:
-      limits.upstream_channel === "codex" || limits.upstream_channel === "grok"
+      limits.upstream_channel === "codex" || limits.upstream_channel === "grok" || limits.upstream_channel === "anthropic"
         ? limits.upstream_channel
         : "auto",
     scopeLimits: scopeLimitsFromAPIKey(limits.scope_limits),
@@ -2555,10 +2556,15 @@ function UpstreamChannelPicker({
       label: t("apiKeys.limits.upstreamChannelGrok"),
       icon: <ChannelLogo channel="grok" size={18} />,
     },
+    {
+      key: "anthropic",
+      label: "Anthropic",
+      icon: <ChannelLogo channel="anthropic" size={18} />,
+    },
   ];
   return (
     <div>
-      <div className="grid grid-cols-3 gap-1 rounded-xl border border-border bg-muted/30 p-1">
+      <div className="grid grid-cols-4 gap-1 rounded-xl border border-border bg-muted/30 p-1">
         {options.map(({ key, label, icon }) => (
           <button
             key={key}

@@ -45,8 +45,10 @@ func (db *DB) ListAccountListProjection(ctx context.Context, channel string) ([]
 	switch channel {
 	case UpstreamChannelGrok:
 		where += ` AND ` + upstreamExpr + ` = 'grok'`
+	case UpstreamChannelAnthropic:
+		where += ` AND ` + upstreamExpr + ` = 'anthropic'`
 	case UpstreamChannelCodex:
-		where += ` AND ` + upstreamExpr + ` <> 'grok'`
+		where += ` AND ` + upstreamExpr + ` NOT IN ('grok', 'anthropic')`
 	}
 	query := `SELECT id, name, type, proxy_url, status, cooldown_reason, cooldown_until,
 		COALESCE(error_message, ''), COALESCE(enabled, true), COALESCE(locked, false),

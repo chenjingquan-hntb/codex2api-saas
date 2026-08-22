@@ -390,6 +390,11 @@ func main() {
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
 	handler.SetRuntimeCache(tc)
+	// 管理端修改 billing 配置后立即使数据面计费配置缓存失效（P2-7）。
+	adminHandler.SetWalletConfigInvalidator(handler.InvalidateWalletConfigCache)
+	// 钱包孤儿预留对账：进程崩溃/异常退出遗留的预留额度定时回收（P0-2）。
+	// 启动即跑一次，之后每小时执行；仅回收超过 24h 仍无收尾的预留。
+	proxy.StartWalletReconciliation(backgroundCtx, db, time.Hour, 24*time.Hour)
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket

@@ -25,14 +25,16 @@ import (
 //     WalletSettle(D, actual) 多退少补；无用量（/v1/models、失败、免费路径）则 WalletRelease(D)。
 //
 // 幂等：每个请求一次预留、一次收尾，键均为 per-request 随机 ID（reserve:/settle:/release:
-// 命名空间），重复收尾/重放由账本唯一约束 + 哨兵回滚兜底（见 database/wallet.go）。
+// 命名空间），重复收尾/重放由账本 (user_id, idempotency_key) 唯一约束 + 哨兵回滚兜底
+// （见 database/wallet.go）。
 //
 // 计费口径：上游美元成本（database/billing.go CalculateCost）× cny_per_usd → 整数微元，
 // 低于 min_charge 按 min_charge，高于 charge_cap 按 charge_cap（0=不封顶）。
 // 失败/超时/客户端中止的请求不产生成功用量 → 全部释放，用户不扣费。
 //
-// 容错策略（fail-open）：计费配置读取失败、钱包 DB 故障时放行请求（记日志/审计），
-// 绝不因计费基础设施问题拖垮数据面；只有「确认余额不足」才 402 拒绝。
+// 容错策略（fail-closed，与 PLAN.md §6/P6 一致）：计费配置读取失败、钱包 DB 故障时，
+// 对「用户归属 Key」的计费请求直接 503 拒绝（不放行不扣费），只有非计费路径
+// （billing 关闭、非用户 Key）才正常放行；「确认余额不足」仍返回 402。
 
 const (
 	walletBillingStateKey = "walletBillingState"
@@ -78,16 +80,17 @@ func (s *walletRequestState) total() int64 {
 	return s.chargeMicro
 }
 
-// walletBillingConfig 返回（缓存的）计费配置；读取失败返回旧缓存或 nil（按关闭处理）。
-func (h *Handler) walletBillingConfig() *database.BillingConfig {
+// walletBillingConfig 返回（缓存的）计费配置；读取失败时返回旧缓存（若有）或错误。
+// 调用方拿到 error 时必须按 fail-closed 处理（拒绝计费请求），不能放行。
+func (h *Handler) walletBillingConfig() (*database.BillingConfig, error) {
 	if h == nil || h.db == nil {
-		return nil
+		return nil, fmt.Errorf("wallet: database unavailable")
 	}
 	cache := &h.walletCfg
 	cache.mu.Lock()
 	defer cache.mu.Unlock()
 	if cache.cfg != nil && time.Since(cache.at) < walletConfigCacheTTL {
-		return cache.cfg
+		return cache.cfg, nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), walletOpTimeout)
 	defer cancel()
@@ -95,22 +98,44 @@ func (h *Handler) walletBillingConfig() *database.BillingConfig {
 	if err != nil {
 		log.Printf("读取钱包计费配置失败: %v", err)
 		if cache.cfg != nil {
-			return cache.cfg
+			// 有旧缓存：基于上次已知配置做确定性判断（比 fail-open 安全）。
+			return cache.cfg, nil
 		}
-		return nil
+		return nil, err
 	}
 	cache.cfg = cfg
 	cache.at = time.Now()
-	return cfg
+	return cfg, nil
+}
+
+// InvalidateWalletConfigCache 清除数据面计费配置缓存（管理端 PUT billing 后调用）。
+func (h *Handler) InvalidateWalletConfigCache() {
+	if h == nil {
+		return
+	}
+	h.walletCfg.mu.Lock()
+	h.walletCfg.cfg = nil
+	h.walletCfg.at = time.Time{}
+	h.walletCfg.mu.Unlock()
 }
 
 // walletBeginBilling 为「用户归属 Key」的请求预留钱包额度；返回 true 表示已预留，
 // 调用方必须 defer finalizeWalletRequest。
+//
+// fail-closed：计费配置不可读或预留失败（非余额不足）时返回 503 并 Abort，不放行。
 func (h *Handler) walletBeginBilling(c *gin.Context, row *database.APIKeyRow) bool {
 	if h == nil || h.db == nil || c == nil || row == nil || row.UserID <= 0 {
 		return false
 	}
-	cfg := h.walletBillingConfig()
+	cfg, err := h.walletBillingConfig()
+	if err != nil {
+		// fail-closed：控制面/DB 故障，无法确定计费开关与额度 → 拒绝计费请求。
+		security.SecurityAuditLog("WALLET_CONFIG_UNAVAILABLE",
+			fmt.Sprintf("user_id=%d path=%s ip=%s", row.UserID, c.Request.URL.Path, c.ClientIP()))
+		api.SendError(c, api.ErrServiceUnavailable)
+		c.Abort()
+		return false
+	}
 	if cfg == nil || !cfg.Enabled {
 		return false
 	}
@@ -141,8 +166,11 @@ func (h *Handler) walletBeginBilling(c *gin.Context, row *database.APIKeyRow) bo
 			c.Abort()
 			return false
 		}
-		// 计费基础设施故障：fail-open 放行，避免钱包 DB 抖动拖垮数据面。
-		log.Printf("钱包预留失败(user=%d): %v", st.UserID, err)
+		// fail-closed：钱包 DB 故障 → 拒绝计费请求，不放行。
+		security.SecurityAuditLog("WALLET_RESERVE_UNAVAILABLE",
+			fmt.Sprintf("user_id=%d path=%s ip=%s err=%v", st.UserID, c.Request.URL.Path, c.ClientIP(), err))
+		api.SendError(c, api.ErrServiceUnavailable)
+		c.Abort()
 		return false
 	}
 	if replayed {
@@ -233,4 +261,47 @@ func newWalletRequestID() string {
 		return fmt.Sprintf("w%x", time.Now().UnixNano())
 	}
 	return hex.EncodeToString(b)
+}
+
+// StartWalletReconciliation 启动钱包孤儿预留对账：启动即执行一次，之后按 interval
+// 周期执行。释放超过 orphanAge 仍无对应 release/consume 的预留（进程崩溃/收尾失败
+// 遗留），避免 reserved 永久占用、available 永久减少。对账动作本身幂等（recover:
+// 键），多进程并发/重启重跑安全。interval/orphanAge <=0 时使用默认值。
+func StartWalletReconciliation(ctx context.Context, db *database.DB, interval, orphanAge time.Duration) {
+	if ctx == nil || db == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	if orphanAge <= 0 {
+		orphanAge = 24 * time.Hour
+	}
+	run := func(why string) {
+		reconcileCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		n, micro, err := db.ReconcileOrphanedWalletReservations(reconcileCtx, orphanAge, 500)
+		if err != nil {
+			log.Printf("钱包孤儿预留对账失败(%s): %v", why, err)
+			return
+		}
+		if n > 0 {
+			security.SecurityAuditLog("WALLET_ORPHAN_RESERVATION_RECOVERED",
+				fmt.Sprintf("count=%d micro=%d", n, micro))
+			log.Printf("钱包孤儿预留对账(%s): 恢复 %d 条预留, 合计 %d 微元", why, n, micro)
+		}
+	}
+	db.RunBackgroundTask(func(taskCtx context.Context) {
+		run("startup")
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-taskCtx.Done():
+				return
+			case <-ticker.C:
+				run("periodic")
+			}
+		}
+	})
 }
