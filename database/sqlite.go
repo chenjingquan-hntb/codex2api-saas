@@ -544,6 +544,34 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
 		`CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user_created ON wallet_transactions(user_id, created_at);`,
+		`CREATE TABLE IF NOT EXISTS redeem_code_batches (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			name TEXT NOT NULL DEFAULT '',
+			amount_micro INTEGER NOT NULL,
+			total_count INTEGER NOT NULL DEFAULT 0,
+			used_count INTEGER NOT NULL DEFAULT 0,
+			revoked_count INTEGER NOT NULL DEFAULT 0,
+			status TEXT NOT NULL DEFAULT 'active',
+			expires_at TIMESTAMP NULL,
+			created_by INTEGER NOT NULL DEFAULT 0,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS redeem_codes (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			batch_id INTEGER NOT NULL,
+			code_hash TEXT NOT NULL UNIQUE,
+			code_prefix TEXT NOT NULL DEFAULT '',
+			amount_micro INTEGER NOT NULL,
+			status TEXT NOT NULL DEFAULT 'unused',
+			used_by_user_id INTEGER NOT NULL DEFAULT 0,
+			used_at TIMESTAMP NULL,
+			expires_at TIMESTAMP NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_redeem_codes_batch ON redeem_codes(batch_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_redeem_codes_status ON redeem_codes(status);`,
+		`CREATE INDEX IF NOT EXISTS idx_redeem_codes_used_user ON redeem_codes(used_by_user_id);`,
 		`CREATE TABLE IF NOT EXISTS system_setting_values (
 			key TEXT PRIMARY KEY,
 			value_json TEXT NOT NULL DEFAULT '{}',

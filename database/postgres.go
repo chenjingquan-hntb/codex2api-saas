@@ -1642,6 +1642,36 @@ func (db *DB) migrate(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user_created ON wallet_transactions(user_id, created_at);
 
+	-- 兑换码批次与兑换码（P6）：code 只存 SHA-256 摘要，明文仅在批次创建时返回一次。
+	CREATE TABLE IF NOT EXISTS redeem_code_batches (
+		id            BIGSERIAL PRIMARY KEY,
+		name          VARCHAR(128) NOT NULL DEFAULT '',
+		amount_micro  BIGINT NOT NULL,
+		total_count   INTEGER NOT NULL DEFAULT 0,
+		used_count    INTEGER NOT NULL DEFAULT 0,
+		revoked_count INTEGER NOT NULL DEFAULT 0,
+		status        VARCHAR(16) NOT NULL DEFAULT 'active',
+		expires_at    TIMESTAMPTZ NULL,
+		created_by    BIGINT NOT NULL DEFAULT 0,
+		created_at    TIMESTAMPTZ DEFAULT NOW(),
+		updated_at    TIMESTAMPTZ DEFAULT NOW()
+	);
+	CREATE TABLE IF NOT EXISTS redeem_codes (
+		id              BIGSERIAL PRIMARY KEY,
+		batch_id        BIGINT NOT NULL,
+		code_hash       VARCHAR(64) NOT NULL UNIQUE,
+		code_prefix     VARCHAR(16) NOT NULL DEFAULT '',
+		amount_micro    BIGINT NOT NULL,
+		status          VARCHAR(16) NOT NULL DEFAULT 'unused',
+		used_by_user_id BIGINT NOT NULL DEFAULT 0,
+		used_at         TIMESTAMPTZ NULL,
+		expires_at      TIMESTAMPTZ NULL,
+		created_at      TIMESTAMPTZ DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_redeem_codes_batch ON redeem_codes(batch_id);
+	CREATE INDEX IF NOT EXISTS idx_redeem_codes_status ON redeem_codes(status);
+	CREATE INDEX IF NOT EXISTS idx_redeem_codes_used_user ON redeem_codes(used_by_user_id);
+
 	-- 控制面 JSON 配置（钱包计费 / SMTP / 易支付 / Turnstile / GeoIP 等），
 	-- 与旧单行 system_settings 标量列分离，按 key 存整段 JSON。
 	CREATE TABLE IF NOT EXISTS system_setting_values (
