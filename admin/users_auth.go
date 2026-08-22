@@ -66,12 +66,12 @@ type logOnlyUserMailer struct{}
 
 func (logOnlyUserMailer) SendVerificationEmail(_ context.Context, to, verifyURL string) error {
 	log.Printf("[user-mailer] 验证邮件(未配置 SMTP，仅日志): to=%s url=%s", security.SanitizeLog(to), verifyURL)
-	return nil
+	return ErrMailerNotConfigured
 }
 
 func (logOnlyUserMailer) SendPasswordResetEmail(_ context.Context, to, resetURL string) error {
 	log.Printf("[user-mailer] 重置邮件(未配置 SMTP，仅日志): to=%s url=%s", security.SanitizeLog(to), resetURL)
-	return nil
+	return ErrMailerNotConfigured
 }
 
 // keyedRateLimiter 按 key（IP/邮箱）的滑动窗口计数限流。
@@ -263,12 +263,12 @@ func (h *Handler) issueVerification(c *gin.Context, userID int64, email string, 
 	base := portalBaseURL(c)
 	verifyURL := fmt.Sprintf("%s/verify-email?token=%s", base, token)
 	emailSent := false
-	if _, isStub := h.userMailer.(logOnlyUserMailer); !isStub {
-		if err := h.userMailer.SendVerificationEmail(c.Request.Context(), email, verifyURL); err != nil {
+	if err := h.userMailer.SendVerificationEmail(c.Request.Context(), email, verifyURL); err != nil {
+		if !errors.Is(err, ErrMailerNotConfigured) {
 			log.Printf("发送验证邮件失败: email=%s err=%v", security.SanitizeLog(email), err)
-		} else {
-			emailSent = true
 		}
+	} else {
+		emailSent = true
 	}
 	c.JSON(statusCode, gin.H{
 		"user_id":        userID,
@@ -566,12 +566,12 @@ func (h *Handler) RequestPasswordReset(c *gin.Context) {
 	base := portalBaseURL(c)
 	resetURL := fmt.Sprintf("%s/reset-password?token=%s", base, token)
 	emailSent := false
-	if _, isStub := h.userMailer.(logOnlyUserMailer); !isStub {
-		if err := h.userMailer.SendPasswordResetEmail(c.Request.Context(), email, resetURL); err != nil {
+	if err := h.userMailer.SendPasswordResetEmail(c.Request.Context(), email, resetURL); err != nil {
+		if !errors.Is(err, ErrMailerNotConfigured) {
 			log.Printf("发送重置邮件失败: email=%s err=%v", security.SanitizeLog(email), err)
-		} else {
-			emailSent = true
 		}
+	} else {
+		emailSent = true
 	}
 	security.SecurityAuditLog("USER_PASSWORD_RESET_REQUESTED", "user_id="+strconv.FormatInt(user.ID, 10)+" ip="+security.SanitizeLog(ip))
 	c.JSON(http.StatusOK, gin.H{

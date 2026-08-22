@@ -938,7 +938,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		cacheDriver:          tc.Driver(),
 		cacheLabel:           tc.Label(),
 		adminSecretEnv:       adminSecretEnv,
-		userMailer:           logOnlyUserMailer{},
+		userMailer:           &smtpMailer{db: db},
 		registerLimiter:      newKeyedRateLimiter(userRegisterRateLimit, userRegisterRateWin),
 		loginIPLimiter:       newKeyedRateLimiter(userLoginRateLimit, userLoginRateWin),
 		loginEmailLimiter:    newKeyedRateLimiter(userLoginEmailRateLimit, userLoginRateWin),
@@ -1145,6 +1145,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/export", h.ExportOpsErrorLogs)
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
+	api.GET("/control-settings", h.GetControlSettings)
+	api.PUT("/control-settings/:section", h.UpdateControlSettingsSection)
+	api.POST("/control-settings/smtp/test", h.TestSMTPConnection)
 	api.PUT("/settings", h.UpdateSettings)
 	api.GET("/settings/observed-instructions", h.GetObservedInstructions)
 	api.POST("/settings/background-upload", h.UploadBackgroundAsset)
