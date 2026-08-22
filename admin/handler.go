@@ -1043,6 +1043,17 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	authAuthed.GET("/sessions", h.ListMySessions)
 	authAuthed.POST("/sessions/:id/revoke", h.RevokeSession)
 
+	// 钱包（P6）：余额、充值订单与支付回调。回调端点对网关开放，不挂会话鉴权；
+	// 入账以服务端验签 + 金额校验 + 幂等键为准，不信任浏览器同步跳转。
+	authAuthed.GET("/wallet", h.GetMyWallet)
+	authAuthed.POST("/wallet/recharge", h.CreateEpayRechargeOrder)
+	authAuthed.GET("/wallet/orders", h.ListMyRechargeOrders)
+	authAuthed.GET("/wallet/orders/:order_no", h.GetMyRechargeOrder)
+
+	payAPI := r.Group("/api/pay")
+	payAPI.POST("/epay/notify", h.EpayNotify)
+	payAPI.GET("/epay/return", h.EpayReturn)
+
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
 	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
 	r.GET("/api/admin/bootstrap-status", h.GetBootstrapStatus)

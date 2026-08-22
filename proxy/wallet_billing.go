@@ -290,6 +290,15 @@ func StartWalletReconciliation(ctx context.Context, db *database.DB, interval, o
 				fmt.Sprintf("count=%d micro=%d", n, micro))
 			log.Printf("钱包孤儿预留对账(%s): 恢复 %d 条预留, 合计 %d 微元", why, n, micro)
 		}
+		// 充值订单到期清理：把已过支付截止时间仍未支付（pending）的订单标记 expired。
+		expiredN, expErr := db.ExpireStaleRechargeOrders(reconcileCtx, 0, 200)
+		if expErr != nil {
+			log.Printf("充值订单到期清理失败(%s): %v", why, expErr)
+			return
+		}
+		if expiredN > 0 {
+			log.Printf("充值订单到期清理(%s): 标记 %d 笔订单过期", why, expiredN)
+		}
 	}
 	db.RunBackgroundTask(func(taskCtx context.Context) {
 		run("startup")
