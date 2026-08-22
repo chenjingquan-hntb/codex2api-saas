@@ -35,6 +35,8 @@ var (
 	ErrInsufficientBalance = errors.New("wallet: insufficient balance")
 	// ErrInsufficientReserved 表示预留额度不足（释放/结算时预留已不存在）。
 	ErrInsufficientReserved = errors.New("wallet: insufficient reserved")
+	// ErrWalletAccountNotFound 表示钱包账户不存在（修复余额等操作）。
+	ErrWalletAccountNotFound = errors.New("wallet: account not found")
 	// errWalletReplay 是内部哨兵：表示幂等键已存在，本次为重放（应回滚事务）。
 	errWalletReplay = errors.New("wallet: idempotent replay")
 )
@@ -462,4 +464,170 @@ func decodeTimeValue(raw interface{}) time.Time {
 		}
 	}
 	return time.Time{}
+}
+
+// ==================== 管理员：对账看板 / 账本重算（P6 收尾） ====================
+
+// PaymentSummary 是管理员对账看板的聚合指标。
+type PaymentSummary struct {
+	TodayPaidCount    int64            `json:"today_paid_count"`    // 今日（UTC 日界）已入账订单数
+	TodayPaidMicro    int64            `json:"today_paid_micro"`    // 今日已入账金额（微元）
+	WeekPaidMicro     int64            `json:"week_paid_micro"`     // 近 7 日已入账金额
+	TotalPaidMicro    int64            `json:"total_paid_micro"`    // 累计已入账金额
+	StatusCounts      map[string]int64 `json:"status_counts"`       // 各状态订单数
+	PendingExpiring   int64            `json:"pending_expiring"`    // pending 且 1 小时内过期（待跟进）
+	RefundedCount     int64            `json:"refunded_count"`      // 退款订单数
+	RefundedMicro     int64            `json:"refunded_micro"`      // 退款总额（微元，正值）
+	AdjustmentCount   int64            `json:"adjustment_count"`    // 余额调整次数
+	LedgerEntryCount  int64            `json:"ledger_entry_count"`  // 账本总条数
+}
+
+// GetPaymentSummary 汇总充值/退款/调整的对账指标。
+func (db *DB) GetPaymentSummary(ctx context.Context) (*PaymentSummary, error) {
+	s := &PaymentSummary{StatusCounts: make(map[string]int64)}
+	now := time.Now().UTC()
+	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	weekAgo := now.Add(-7 * 24 * time.Hour)
+	expiringSoon := now.Add(time.Hour)
+
+	// 订单状态计数。
+	rows, err := db.conn.QueryContext(ctx,
+		`SELECT status, COUNT(*) FROM wallet_transactions GROUP BY status`)
+	if err != nil {
+		return nil, fmt.Errorf("wallet: summary status counts: %w", err)
+	}
+	for rows.Next() {
+		var status string
+		var n int64
+		if err := rows.Scan(&status, &n); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		s.StatusCounts[status] = n
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// 入账金额聚合。
+	type aggRow struct {
+		cnt, micro int64
+	}
+	scanAgg := func(q string, args ...interface{}) (aggRow, error) {
+		var a aggRow
+		if err := db.conn.QueryRowContext(ctx, q, args...).Scan(&a.cnt, &a.micro); err != nil {
+			return a, err
+		}
+		return a, nil
+	}
+	if a, err := scanAgg(`SELECT COUNT(*), COALESCE(SUM(amount_micro),0) FROM wallet_transactions
+		WHERE status = $1 AND created_at >= $2`, RechargeOrderStatusPaid, db.timeArg(todayStart)); err != nil {
+		return nil, err
+	} else {
+		s.TodayPaidCount, s.TodayPaidMicro = a.cnt, a.micro
+	}
+	if a, err := scanAgg(`SELECT COUNT(*), COALESCE(SUM(amount_micro),0) FROM wallet_transactions
+		WHERE status = $1 AND created_at >= $2`, RechargeOrderStatusPaid, db.timeArg(weekAgo)); err != nil {
+		return nil, err
+	} else {
+		s.WeekPaidMicro = a.micro
+	}
+	if a, err := scanAgg(`SELECT COUNT(*), COALESCE(SUM(amount_micro),0) FROM wallet_transactions
+		WHERE status = $1`, RechargeOrderStatusPaid); err != nil {
+		return nil, err
+	} else {
+		s.TotalPaidMicro = a.micro
+	}
+	// pending 且即将过期（含无过期时间的视为不紧急，只统计有 expires_at 的）。
+	if err := db.conn.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM wallet_transactions
+		WHERE status = $1 AND expires_at IS NOT NULL AND expires_at < $2`,
+		RechargeOrderStatusPending, db.timeArg(expiringSoon)).Scan(&s.PendingExpiring); err != nil {
+		return nil, err
+	}
+
+	// 退款（订单 status=refunded + 账本 refund 双口径核对）。
+	if a, err := scanAgg(`SELECT COUNT(*), COALESCE(SUM(amount_micro),0) FROM wallet_transactions
+		WHERE status = $1`, RechargeOrderStatusRefunded); err != nil {
+		return nil, err
+	} else {
+		s.RefundedCount, s.RefundedMicro = a.cnt, a.micro
+	}
+	// 余额调整次数（账本）。
+	if err := db.conn.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM wallet_ledger_entries WHERE type = $1`,
+		string(WalletTxAdjustment)).Scan(&s.AdjustmentCount); err != nil {
+		return nil, err
+	}
+	// 账本总条数。
+	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM wallet_ledger_entries`).Scan(&s.LedgerEntryCount); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+// BalanceDrift 是账本重算发现的余额差异条目。
+type BalanceDrift struct {
+	UserID        int64  `json:"user_id"`
+	Email         string `json:"email"`
+	ExpectedMicro int64  `json:"expected_micro"` // 账本流水重算值
+	ActualMicro   int64  `json:"actual_micro"`   // wallet_accounts 当前值
+	DiffMicro     int64  `json:"diff_micro"`     // expected - actual（>0 表示少记/被多扣）
+}
+
+// ReconcileWalletBalances 对比「账本流水重算余额」与「钱包账户当前余额」，
+// 返回全部差异（无差异时为空列表）。账本 amount_micro 记录的是 available 变动，
+// 故期望余额 = SUM(amount_micro)。reserved 不参与重算（预留/释放自身即成对账目）。
+func (db *DB) ReconcileWalletBalances(ctx context.Context) ([]BalanceDrift, error) {
+	rows, err := db.conn.QueryContext(ctx, `
+		SELECT wa.user_id, COALESCE(wa.available_micro, 0),
+		       COALESCE(SUM(l.amount_micro), 0), COALESCE(u.email, '')
+		FROM wallet_accounts wa
+		LEFT JOIN wallet_ledger_entries l ON l.user_id = wa.user_id
+		LEFT JOIN users u ON u.id = wa.user_id
+		GROUP BY wa.user_id, wa.available_micro, u.email
+		ORDER BY wa.user_id`)
+	if err != nil {
+		return nil, fmt.Errorf("wallet: reconcile: %w", err)
+	}
+	defer rows.Close()
+	var drifts []BalanceDrift
+	for rows.Next() {
+		var d BalanceDrift
+		if err := rows.Scan(&d.UserID, &d.ActualMicro, &d.ExpectedMicro, &d.Email); err != nil {
+			return nil, err
+		}
+		d.DiffMicro = d.ExpectedMicro - d.ActualMicro
+		if d.DiffMicro != 0 {
+			drifts = append(drifts, d)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return drifts, nil
+}
+
+// FixWalletBalance 把指定钱包账户的 available 修复为账本重算值（管理员操作）。
+// 直接更新余额、不写账本：账本是权威，重算值即期望值，写账本反而引入新一轮漂移。
+func (db *DB) FixWalletBalance(ctx context.Context, userID, expectedMicro int64) error {
+	if userID <= 0 {
+		return fmt.Errorf("wallet: fix balance: invalid user")
+	}
+	if expectedMicro < 0 {
+		return fmt.Errorf("wallet: fix balance: expected must be non-negative, got %d", expectedMicro)
+	}
+	res, err := db.conn.ExecContext(ctx, `
+		UPDATE wallet_accounts
+		SET available_micro = $1, version = version + 1, updated_at = $2
+		WHERE user_id = $3`,
+		expectedMicro, db.timeArg(time.Now().UTC()), userID)
+	if err != nil {
+		return fmt.Errorf("wallet: fix balance: %w", err)
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return ErrWalletAccountNotFound
+	}
+	return nil
 }

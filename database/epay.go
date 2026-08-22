@@ -26,6 +26,7 @@ const (
 	RechargeOrderStatusPaid      = "paid"
 	RechargeOrderStatusExpired   = "expired"
 	RechargeOrderStatusCancelled = "cancelled"
+	RechargeOrderStatusRefunded  = "refunded"
 )
 
 var (
@@ -35,6 +36,10 @@ var (
 	ErrEpayOrderClosed = errors.New("epay: order closed")
 	// ErrEpayAmountMismatch 表示回调金额与订单金额不一致。
 	ErrEpayAmountMismatch = errors.New("epay: callback amount mismatch")
+	// ErrEpayOrderNotPaid 表示订单尚未入账（pending/expired/cancelled 不能退款）。
+	ErrEpayOrderNotPaid = errors.New("epay: order not paid")
+	// ErrEpayRefundAlreadyDone 表示该订单已退款（重放，幂等语义）。
+	ErrEpayRefundAlreadyDone = errors.New("epay: refund already done")
 )
 
 // RechargeOrder 是充值订单记录（wallet_transactions）。
@@ -77,8 +82,7 @@ func scanRechargeOrder(row interface{ Scan(...any) error }) (*RechargeOrder, err
 }
 
 // optionalTimeValue 把 NULL 兼容的时间值解码为 (time, true)，NULL 返回 (_, false)。
-func optionalTimeValue(raw interface{}) (time.Time, bool) {
-	switch v := raw.(type) {
+func optionalTimeValue(raw interface{}) (time.Time, bool) {	switch v := raw.(type) {
 	case nil:
 		return time.Time{}, false
 	case time.Time:
@@ -308,4 +312,187 @@ func (db *DB) ExpireStaleRechargeOrders(ctx context.Context, grace time.Duration
 		return 0, err
 	}
 	return int(n), nil
+}
+
+// ==================== 管理员：订单管理 / 冲正（P6 收尾） ====================
+
+// RechargeOrderWithUser 是管理员视图的充值订单（附带用户邮箱）。
+type RechargeOrderWithUser struct {
+	RechargeOrder
+	Email string
+}
+
+// RechargeOrderFilter 是管理员订单列表的过滤条件（全部可选）。
+type RechargeOrderFilter struct {
+	OrderNo string // 精确匹配
+	Email   string // 精确匹配用户邮箱
+	Status  string // 空=全部
+	UserID  int64  // >0 时按用户过滤
+}
+
+// ListAllRechargeOrders 跨用户分页列出充值订单（管理员），JOIN 用户邮箱。
+func (db *DB) ListAllRechargeOrders(ctx context.Context, f RechargeOrderFilter, limit, offset int) ([]RechargeOrderWithUser, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	q := `SELECT t.id, t.user_id, t.order_no, t.channel, t.amount_micro, t.status, t.pay_url,
+	             t.callback_payload, t.verified_at, t.expires_at, t.created_at, t.updated_at, u.email
+	      FROM wallet_transactions t
+	      JOIN users u ON u.id = t.user_id
+	      WHERE 1 = 1`
+	var args []interface{}
+	add := func(cond string, val interface{}) {
+		args = append(args, val)
+		q += fmt.Sprintf(" AND %s = $%d", cond, len(args))
+	}
+	if f.OrderNo != "" {
+		add("t.order_no", f.OrderNo)
+	}
+	if f.Email != "" {
+		add("u.email", f.Email)
+	}
+	if f.Status != "" {
+		add("t.status", f.Status)
+	}
+	if f.UserID > 0 {
+		add("t.user_id", f.UserID)
+	}
+	args = append(args, limit, offset)
+	q += fmt.Sprintf(" ORDER BY t.id DESC LIMIT $%d OFFSET $%d", len(args)-1, len(args))
+
+	rows, err := db.conn.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("epay: list all orders: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]RechargeOrderWithUser, 0, limit)
+	for rows.Next() {
+		var o RechargeOrderWithUser
+		var verifiedRaw, expiresRaw, createdRaw, updatedRaw interface{}
+		if err := rows.Scan(
+			&o.ID, &o.UserID, &o.OrderNo, &o.Channel, &o.AmountMicro, &o.Status, &o.PayURL,
+			&o.CallbackPayload, &verifiedRaw, &expiresRaw, &createdRaw, &updatedRaw, &o.Email,
+		); err != nil {
+			return nil, err
+		}
+		if t, ok := optionalTimeValue(verifiedRaw); ok {
+			o.VerifiedAt = &t
+		}
+		if t, ok := optionalTimeValue(expiresRaw); ok {
+			o.ExpiresAt = &t
+		}
+		o.CreatedAt = decodeTimeValue(createdRaw)
+		o.UpdatedAt = decodeTimeValue(updatedRaw)
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// RefundRechargeOrder 对已入账订单做整单退款冲正（管理员）。
+//
+// 单事务语义（与充值回调同构）：
+//   - 只允许 refund paid 订单；pending/expired/cancelled 拒绝（ErrEpayOrderNotPaid）；
+//   - 幂等键 admin_refund:<order_no>：重复退款返回 replayed=true，绝不重复扣款；
+//   - 从 available 扣回订单金额（不允许透支：用户已花掉的部分无法退回，
+//     管理员需先用 balance adjustment 处理，保持 fail-closed 不透支）；
+//   - 成功后订单状态置 refunded，账本记 type=refund 反向条目。
+func (db *DB) RefundRechargeOrder(ctx context.Context, orderNo string, operatorID int64, reason string) (bool, error) {
+	orderNo = strings.TrimSpace(orderNo)
+	if orderNo == "" {
+		return false, fmt.Errorf("epay: order_no is required")
+	}
+	replayed := false
+	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		var userID, amountMicro int64
+		var status string
+		err := tx.QueryRowContext(ctx, `
+			SELECT user_id, amount_micro, status
+			FROM wallet_transactions
+			WHERE order_no = $1`, orderNo).Scan(&userID, &amountMicro, &status)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrEpayOrderNotFound
+			}
+			return err
+		}
+		switch status {
+		case RechargeOrderStatusRefunded:
+			replayed = true
+			return nil
+		case RechargeOrderStatusPaid:
+			// 继续
+		default:
+			return ErrEpayOrderNotPaid
+		}
+		if err := db.walletApplyTx(ctx, tx, walletApply{
+			UserID:          userID,
+			Type:            WalletTxRefund,
+			AmountMicro:     -amountMicro,
+			DeltaAvailable:  -amountMicro,
+			DeltaReserved:   0,
+			RefType:         "epay_refund",
+			RefID:           orderNo,
+			IdempotencyKey:  "admin_refund:" + orderNo,
+			OperatorID:      operatorID,
+			Reason:          reason,
+			InsufficientErr: ErrInsufficientBalance,
+		}); err != nil {
+			if errors.Is(err, errWalletReplay) {
+				replayed = true
+				return nil
+			}
+			return err
+		}
+		now := db.timeArg(time.Now().UTC())
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE wallet_transactions
+			SET status = $1, updated_at = $2
+			WHERE order_no = $3`, RechargeOrderStatusRefunded, now, orderNo); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return replayed, nil
+}
+
+// AdminConfirmEpayOrder 网关漏回调时的管理员补录入账。
+// 复用 CreditEpayCallback 的单事务入账路径（幂等键 epay:<order_no> 与网关回调
+// 共用，重复补录/回调双发都不会重复加钱）。
+func (db *DB) AdminConfirmEpayOrder(ctx context.Context, orderNo string) (bool, error) {
+	orderNo = strings.TrimSpace(orderNo)
+	if orderNo == "" {
+		return false, fmt.Errorf("epay: order_no is required")
+	}
+	var amountMicro int64
+	err := db.conn.QueryRowContext(ctx,
+		`SELECT amount_micro FROM wallet_transactions WHERE order_no = $1`, orderNo).Scan(&amountMicro)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, ErrEpayOrderNotFound
+		}
+		return false, err
+	}
+	return db.CreditEpayCallback(ctx, orderNo, "manual_confirm_by_admin", amountMicro)
+}
+
+// AdminAdjustWalletBalance 管理员余额调整（补偿/扣错）。
+// deltaMicro 可正可负；不允许把余额调到负（walletApplyTx 兜底）。
+// 幂等键由调用方生成（建议 UUID），内部加命名空间 admin_adjust: 防与其他业务冲突。
+func (db *DB) AdminAdjustWalletBalance(ctx context.Context, userID, deltaMicro int64, idempotencyKey, reason string, operatorID int64) (bool, error) {
+	if deltaMicro == 0 {
+		return false, fmt.Errorf("wallet: adjust amount must be non-zero")
+	}
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return false, fmt.Errorf("wallet: adjust idempotency key is required")
+	}
+	return db.WalletCredit(ctx, userID, deltaMicro, WalletTxAdjustment,
+		"admin_adjust", strings.TrimSpace(idempotencyKey),
+		"admin_adjust:"+strings.TrimSpace(idempotencyKey), operatorID, reason)
 }
