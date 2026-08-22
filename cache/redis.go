@@ -644,3 +644,58 @@ func (tc *redisTokenCache) GetRuntimeCounters(ctx context.Context, namespace str
 
 // SharedAcrossInstances 报告 Redis 运行态缓存跨实例共享。
 func (tc *redisTokenCache) SharedAcrossInstances() bool { return true }
+
+// invalidationSubscribeRetry 是订阅消费者在订阅连接意外退出后的重启等待。
+const invalidationSubscribeRetry = 3 * time.Second
+
+// PublishInvalidation 发布一条失效广播（Redis PUBLISH，尽力而为）。
+func (tc *redisTokenCache) PublishInvalidation(ctx context.Context, topic string, payload []byte) error {
+	if tc == nil || tc.client == nil {
+		return fmt.Errorf("redis cache not initialized")
+	}
+	if err := tc.client.Publish(ctx, topic, payload).Err(); err != nil {
+		return fmt.Errorf("redis publish %q: %w", topic, err)
+	}
+	return nil
+}
+
+// SubscribeInvalidation 订阅失效总线。go-redis 的 Subscribe 在连接断开后会自动重连，
+// 但订阅消费循环（ReceiveMessage）在 ctx 取消前持续运行；若 channel 关闭则等待后重启。
+func (tc *redisTokenCache) SubscribeInvalidation(ctx context.Context, topic string, handler InvalidationHandler) error {
+	if tc == nil || tc.client == nil || handler == nil {
+		return fmt.Errorf("redis cache not initialized")
+	}
+	pubsub := tc.client.Subscribe(ctx, topic)
+	go func() {
+		defer func() {
+			_ = pubsub.Close()
+			if r := recover(); r != nil {
+				log.Printf("失效广播消费者 panic: %v", r)
+			}
+		}()
+		for {
+			msg, err := pubsub.ReceiveMessage(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				log.Printf("失效广播订阅中断(%s): %v，%.0fs 后重连", topic, err, invalidationSubscribeRetry.Seconds())
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(invalidationSubscribeRetry):
+					continue
+				}
+			}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("失效广播处理 panic(topic=%s): %v", topic, r)
+					}
+				}()
+				handler(ctx, []byte(msg.Payload))
+			}()
+		}
+	}()
+	return nil
+}

@@ -400,6 +400,10 @@ func main() {
 	// CODEX_CONTROL_BASE_URL 的数据面/控制面节点才启动）。
 	admin.StartEndpointHeartbeat(backgroundCtx, admin.EndpointHeartbeatConfigFromEnv())
 
+	// P7.2 失效传播总线：订阅 Redis Pub/Sub 失效广播，清理本地运行态缓存
+	//（多区本地 Redis 形态下撤销即时跨节点生效；TTL 兜底窗口见 CODEX_API_KEY_CACHE_TTL）。
+	adminHandler.StartInvalidationBus(backgroundCtx)
+
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
 

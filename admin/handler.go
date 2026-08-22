@@ -864,6 +864,10 @@ func (h *Handler) invalidateAPIKeyRuntimeCaches(ctx context.Context, apiKey stri
 	h.deleteRuntimeCache(ctx, adminAPIKeyCountNamespace, "all")
 	if strings.TrimSpace(apiKey) != "" {
 		h.deleteRuntimeCache(ctx, adminAPIKeyCacheNamespace, apiKey)
+		// P7.2：广播失效事件到全节点（多区本地 Redis 形态下其余节点据此清本地缓存）。
+		// 尽力而为：PUBLISH 失败不阻塞撤销主路径，窗口由缓存 TTL 兜底。
+		h.publishInvalidation(ctx, newInvalidationEvent(
+			invalidationEventTypeAPIKey, apiKey, 0, 0))
 	}
 }
 

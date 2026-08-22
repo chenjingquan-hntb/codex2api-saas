@@ -5814,3 +5814,26 @@ func TestResponsesCompactSuffixOnlyRequestLogsBaseModel(t *testing.T) {
 		t.Fatalf("x-model = %q, want base gpt-5.6-sol (suffix stripped for display)", got)
 	}
 }
+
+func TestAPIKeyCacheTTLConfig(t *testing.T) {
+	// 默认 5m。
+	t.Setenv("CODEX_API_KEY_CACHE_TTL", "")
+	if got := apiKeyCacheTTL(); got != 5*time.Minute {
+		t.Fatalf("default ttl = %v", got)
+	}
+	// 合法配置。
+	t.Setenv("CODEX_API_KEY_CACHE_TTL", "1m")
+	if got := apiKeyCacheTTL(); got != time.Minute {
+		t.Fatalf("configured ttl = %v", got)
+	}
+	// 低于最小 30s → 回落默认（防误配把撤销窗口压得太窄）。
+	t.Setenv("CODEX_API_KEY_CACHE_TTL", "5s")
+	if got := apiKeyCacheTTL(); got != 5*time.Minute {
+		t.Fatalf("below-min ttl = %v", got)
+	}
+	// 非法值 → 回落默认。
+	t.Setenv("CODEX_API_KEY_CACHE_TTL", "banana")
+	if got := apiKeyCacheTTL(); got != 5*time.Minute {
+		t.Fatalf("invalid ttl = %v", got)
+	}
+}

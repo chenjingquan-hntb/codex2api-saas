@@ -45,6 +45,9 @@ type MemoryTokenCache struct {
 	responses map[string]memoryResponseContextEntry
 	runtime   map[string]memoryRuntimeEntry
 	poolSize  int
+
+	// invalidationSubs：进程内失效广播订阅者（topic → handlers）。
+	invalidationSubs map[string][]InvalidationHandler
 }
 
 // NewMemory 创建内存缓存实现。
@@ -53,13 +56,14 @@ func NewMemory(poolSize int) TokenCache {
 		poolSize = 1
 	}
 	tc := &MemoryTokenCache{
-		tokens:    make(map[int64]memoryTokenEntry),
-		locks:     make(map[int64]time.Time),
-		leases:    make(map[string]memoryLeaseEntry),
-		sessions:  make(map[string]memorySessionAffinityEntry),
-		responses: make(map[string]memoryResponseContextEntry),
-		runtime:   make(map[string]memoryRuntimeEntry),
-		poolSize:  poolSize,
+		tokens:           make(map[int64]memoryTokenEntry),
+		locks:            make(map[int64]time.Time),
+		leases:           make(map[string]memoryLeaseEntry),
+		sessions:         make(map[string]memorySessionAffinityEntry),
+		responses:        make(map[string]memoryResponseContextEntry),
+		runtime:          make(map[string]memoryRuntimeEntry),
+		invalidationSubs: make(map[string][]InvalidationHandler),
+		poolSize:         poolSize,
 	}
 	// 启动后台定时清理过期 token 和过期锁，防止已删除账号的条目永驻内存
 	go tc.cleanupLoop()
@@ -499,3 +503,42 @@ func (tc *MemoryTokenCache) GetRuntimeCounters(ctx context.Context, namespace st
 
 // SharedAcrossInstances 报告进程内内存缓存不跨实例共享。
 func (tc *MemoryTokenCache) SharedAcrossInstances() bool { return false }
+
+// PublishInvalidation 进程内同步扇出给本进程订阅者（模拟 Redis Pub/Sub 语义；
+// 单机内存模式传播即时可见，测试可用它验证整条链路）。
+func (tc *MemoryTokenCache) PublishInvalidation(ctx context.Context, topic string, payload []byte) error {
+	tc.mu.RLock()
+	handlers := append([]InvalidationHandler(nil), tc.invalidationSubs[topic]...)
+	tc.mu.RUnlock()
+	for _, h := range handlers {
+		h(ctx, payload)
+	}
+	return nil
+}
+
+// SubscribeInvalidation 注册进程内订阅者；调用方 ctx 取消时由外层负责停止。
+// 内存驱动没有网络断连问题，直接注册即可（同步扇出）。
+func (tc *MemoryTokenCache) SubscribeInvalidation(ctx context.Context, topic string, handler InvalidationHandler) error {
+	if handler == nil {
+		return fmt.Errorf("memory cache: nil handler")
+	}
+	tc.mu.Lock()
+	tc.invalidationSubs[topic] = append(tc.invalidationSubs[topic], handler)
+	tc.mu.Unlock()
+	go func() {
+		<-ctx.Done()
+		tc.mu.Lock()
+		subs := tc.invalidationSubs[topic]
+		for i, h := range subs {
+			if fmt.Sprintf("%p", h) == fmt.Sprintf("%p", handler) {
+				tc.invalidationSubs[topic] = append(subs[:i], subs[i+1:]...)
+				break
+			}
+		}
+		if len(tc.invalidationSubs[topic]) == 0 {
+			delete(tc.invalidationSubs, topic)
+		}
+		tc.mu.Unlock()
+	}()
+	return nil
+}

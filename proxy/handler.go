@@ -67,9 +67,23 @@ type Handler struct {
 const (
 	apiKeyCacheNamespace      = "api-key"
 	apiKeyCountCacheNamespace = "api-key-count"
-	apiKeyCacheTTL            = 5 * time.Minute
 	apiKeyCountCacheTTL       = 30 * time.Second
 )
+
+// apiKeyCacheTTL 是 API key 运行态缓存 TTL（P7.2 TTL 兜底：广播丢消息时
+// 撤销在最长 TTL 内扩散到全节点）。可经 CODEX_API_KEY_CACHE_TTL 配置缩短
+//（默认 5m，最小 30s；越短撤销越即时、代价是更多 DB 回源）。
+func apiKeyCacheTTL() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("CODEX_API_KEY_CACHE_TTL"))
+	if raw == "" {
+		return 5 * time.Minute
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d < 30*time.Second {
+		return 5 * time.Minute
+	}
+	return d
+}
 
 type apiKeyRuntimeRecord struct {
 	ID        int64     `json:"id"`
@@ -1151,7 +1165,7 @@ func (h *Handler) setAPIKeyRuntimeCache(row *database.APIKeyRow) {
 	if row.KeyHash != "" {
 		cacheKey = row.KeyHash
 	}
-	if err := h.cache.SetRuntime(ctx, apiKeyCacheNamespace, cacheKey, payload, apiKeyCacheTTL); err != nil {
+	if err := h.cache.SetRuntime(ctx, apiKeyCacheNamespace, cacheKey, payload, apiKeyCacheTTL()); err != nil {
 		log.Printf("写入 API Key Redis 缓存失败: id=%d err=%v", row.ID, err)
 	}
 }

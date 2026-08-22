@@ -79,4 +79,14 @@ type TokenCache interface {
 	// SharedAcrossInstances 表示运行态缓存是否跨实例共享（Redis 为 true，进程内内存为 false）。
 	// 调用方据此决定是否值得为跨实例一致性付额外的往返开销。
 	SharedAcrossInstances() bool
+
+	// PublishInvalidation 向失效传播总线发布一条消息（尽力而为；失败由调用方记账）。
+	// Redis 驱动走 PUBLISH（多区本地 Redis 时经共享通道扇出）；内存驱动进程内同步广播。
+	PublishInvalidation(ctx context.Context, topic string, payload []byte) error
+	// SubscribeInvalidation 订阅失效传播总线并异步消费。handler 必须幂等（同一事件可能
+	// 被投递多次或由多个订阅者处理）；返回值供测试同步等待首次订阅完成。
+	SubscribeInvalidation(ctx context.Context, topic string, handler InvalidationHandler) error
 }
+
+// InvalidationHandler 处理一条失效广播消息（ctx 可能带超时，handler 不应阻塞过久）。
+type InvalidationHandler func(ctx context.Context, payload []byte)

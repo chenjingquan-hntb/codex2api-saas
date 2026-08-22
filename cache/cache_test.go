@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
 	"testing"
 	"time"
 )
@@ -465,4 +466,54 @@ func BenchmarkMemoryGetAccessTokenParallel(b *testing.B) {
 			i++
 		}
 	})
+}
+
+func TestMemoryTokenCache_InvalidationBus(t *testing.T) {
+	tc := NewMemory(1)
+	defer tc.Close()
+	ctx := context.Background()
+
+	// 预置一条运行态缓存，稍后验证订阅者能按事件清理。
+	value := json.RawMessage(`{"id":1}`)
+	if err := tc.SetRuntime(ctx, "ns", "k1", value, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	// 订阅者：收到事件后删 "ns/k1"。
+	received := make(chan string, 4)
+	handler := func(ctx context.Context, payload []byte) {
+		received <- string(payload)
+		_ = tc.DeleteRuntime(ctx, "ns", "k1")
+	}
+	if err := tc.SubscribeInvalidation(ctx, "test-topic", handler); err != nil {
+		t.Fatal(err)
+	}
+
+	// 发布 → 同步扇出。
+	if err := tc.PublishInvalidation(ctx, "test-topic", []byte(`{"type":"api_key","api_key":"k1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-received:
+		if !strings.Contains(got, `"api_key":"k1"`) {
+			t.Fatalf("payload = %s", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("handler not invoked")
+	}
+	// 缓存键已被订阅者清理。
+	if _, ok, _ := tc.GetRuntime(ctx, "ns", "k1"); ok {
+		t.Fatal("cache key should be deleted by subscriber")
+	}
+
+	// 重复发布（幂等语义）：handler 重复执行不 panic。
+	for i := 0; i < 3; i++ {
+		if err := tc.PublishInvalidation(ctx, "test-topic", []byte(`{"id":"dup"}`)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 未订阅 topic：publish 无副作用（不 panic）。
+	if err := tc.PublishInvalidation(ctx, "other-topic", []byte("x")); err != nil {
+		t.Fatal(err)
+	}
 }
