@@ -24,6 +24,7 @@ import (
 	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/imagestore"
+	"github.com/codex2api/internal/version"
 	"github.com/codex2api/proxy"
 	"github.com/codex2api/proxy/wsrelay"
 	"github.com/codex2api/security"
@@ -42,6 +43,9 @@ func migrateOnlyEnabled() bool {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Codex2API v2 启动中...")
+
+	// 进程启动时刻，用于 /version 的 uptime 计算。
+	startedAt := time.Now()
 
 	// 1. 加载配置 (.env)
 	cfg, err := config.Load(".env")
@@ -521,6 +525,27 @@ func main() {
 			"available":       available,
 			"total":           total,
 			"counts_complete": countsComplete,
+		})
+	})
+
+	// 版本与配置摘要：只返回非敏感字段，供运维定位版本/回滚轨迹与负载均衡探测。
+	// 注意：这里不输出数据库/Redis 凭据、上游账号、密钥或内部拓扑。
+	r.GET("/version", func(c *gin.Context) {
+		info := version.Runtime()
+		c.JSON(200, gin.H{
+			"version":                 info.Version,
+			"commit":                  info.Commit,
+			"build_time":              info.BuildTime,
+			"go_version":              info.GoVersion,
+			"uptime_seconds":          int64(time.Since(startedAt).Seconds()),
+			"config": gin.H{
+				"port":                   cfg.Port,
+				"bind_address":           cfg.BindAddress,
+				"database_driver":        cfg.Database.Label(),
+				"cache_driver":           cfg.Cache.Label(),
+				"codex_upstream_transport": cfg.CodexUpstreamTransport,
+				"allow_anonymous_v1":     cfg.AllowAnonymousV1,
+			},
 		})
 	})
 
