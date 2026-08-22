@@ -22,11 +22,16 @@ func TestUTLSConnCreationSetsIdleConnTimeout(t *testing.T) {
 	}
 
 	// 断言 createConnection 构造的 http2.Transport 三项保活/回收参数齐备。
-	tr := &http2.Transport{
-		ReadIdleTimeout: codexHTTP2ReadIdleTimeout,
-		PingTimeout:     codexHTTP2PingTimeout,
-		IdleConnTimeout: codexUTLSIdleConnTimeout,
+	// Go 1.27 起必须经 http2.ConfigureTransports 绑定底层 net/http.Transport，
+	// 这里同样按该路径构造，确保覆盖的是生产构建方式而非旧的 &http2.Transport{}。
+	t1 := &http.Transport{}
+	tr, err := http2.ConfigureTransports(t1)
+	if err != nil {
+		t.Fatalf("ConfigureTransports: %v", err)
 	}
+	tr.ReadIdleTimeout = codexHTTP2ReadIdleTimeout
+	tr.PingTimeout = codexHTTP2PingTimeout
+	tr.IdleConnTimeout = codexUTLSIdleConnTimeout
 	if tr.IdleConnTimeout == 0 {
 		t.Fatal("IdleConnTimeout 为 0：NewClientConn 会跳过空闲定时器安装")
 	}
