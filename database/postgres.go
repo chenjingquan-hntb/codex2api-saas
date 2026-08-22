@@ -1691,6 +1691,27 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ NULL;
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS created_by BIGINT NOT NULL DEFAULT 0;
 	CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
+
+	-- P7 多端点控制面：节点注册/心跳/Drain/单节点吊销
+	CREATE TABLE IF NOT EXISTS service_endpoints (
+		id            BIGSERIAL PRIMARY KEY,
+		endpoint_id   VARCHAR(64) NOT NULL UNIQUE,
+		name          VARCHAR(120) NOT NULL DEFAULT '',
+		region        VARCHAR(50) NOT NULL DEFAULT '',
+		base_url      VARCHAR(300) NOT NULL DEFAULT '',
+		role          VARCHAR(20) NOT NULL DEFAULT 'data',
+		status        VARCHAR(16) NOT NULL DEFAULT 'offline',
+		version       VARCHAR(40) NOT NULL DEFAULT '',
+		capacity      INTEGER NOT NULL DEFAULT 0,
+		heartbeat_at  TIMESTAMPTZ NULL,
+		last_seen_at  TIMESTAMPTZ NULL,
+		started_at    TIMESTAMPTZ NULL,
+		drained_at    TIMESTAMPTZ NULL,
+		revoked_at    TIMESTAMPTZ NULL,
+		created_at    TIMESTAMPTZ DEFAULT NOW(),
+		updated_at    TIMESTAMPTZ DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_service_endpoints_status ON service_endpoints(status);
 	`
 	_, err := db.conn.ExecContext(ctx, query)
 	if err != nil {

@@ -396,6 +396,10 @@ func main() {
 	// 启动即跑一次，之后每小时执行；仅回收超过 24h 仍无收尾的预留。
 	proxy.StartWalletReconciliation(backgroundCtx, db, time.Hour, 24*time.Hour)
 
+	// P7.1 多端点控制面：节点注册+心跳（配置了 CODEX_ENDPOINT_ID 与
+	// CODEX_CONTROL_BASE_URL 的数据面/控制面节点才启动）。
+	admin.StartEndpointHeartbeat(backgroundCtx, admin.EndpointHeartbeatConfigFromEnv())
+
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket
 

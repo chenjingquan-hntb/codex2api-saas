@@ -1004,6 +1004,14 @@ func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
 
 // RegisterRoutes 注册管理 API 路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
+	// P7.1：公网健康检查（CDN/GSLB 消费；DB 故障 503，drain 时 200+draining）。
+	r.GET("/healthz", h.GetHealthz)
+	// P7.1：节点注册/心跳协议（X-Endpoint-Token 鉴权，未配置 token fail-closed 503）。
+	endpointAPI := r.Group("/api/endpoints")
+	endpointAPI.Use(h.endpointTokenGate())
+	endpointAPI.POST("/register", h.RegisterEndpoint)
+	endpointAPI.POST("/heartbeat", h.HeartbeatEndpoint)
+
 	r.GET("/p/img/:id", h.GetSignedImageAssetFile)
 	r.GET("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
 	r.HEAD("/p/backgrounds/:filename", h.GetBackgroundAssetFile)
@@ -1087,6 +1095,12 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 			h.invalidateAccountSnapshotCaches()
 		}
 	})
+	// P7.1 多端点控制面：节点列表与生命周期管理。
+	api.GET("/endpoints", h.ListAdminEndpoints)
+	api.POST("/endpoints", h.AdminUpsertEndpoint)
+	api.POST("/endpoints/:endpoint_id/drain", h.AdminDrainEndpoint)
+	api.POST("/endpoints/:endpoint_id/activate", h.AdminActivateEndpoint)
+	api.POST("/endpoints/:endpoint_id/revoke", h.AdminRevokeEndpoint)
 	api.GET("/stats", h.GetStats)
 	api.GET("/accounts", h.ListAccounts)
 	api.GET("/accounts/analysis", h.GetAccountAnalysis)

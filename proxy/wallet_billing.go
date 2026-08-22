@@ -299,6 +299,15 @@ func StartWalletReconciliation(ctx context.Context, db *database.DB, interval, o
 		if expiredN > 0 {
 			log.Printf("充值订单到期清理(%s): 标记 %d 笔订单过期", why, expiredN)
 		}
+		// P7.1：多端点心跳超时落库（展示判定不依赖它，仅作后台清理）。
+		staleEPs, epErr := db.ExpireStaleEndpoints(reconcileCtx, 3*time.Minute, 200)
+		if epErr != nil {
+			log.Printf("端点超时下线清理失败(%s): %v", why, epErr)
+			return
+		}
+		if staleEPs > 0 {
+			log.Printf("端点超时下线清理(%s): %d 个节点标记 offline", why, staleEPs)
+		}
 	}
 	db.RunBackgroundTask(func(taskCtx context.Context) {
 		run("startup")

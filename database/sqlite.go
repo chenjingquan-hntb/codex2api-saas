@@ -578,6 +578,25 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			updated_by INTEGER NOT NULL DEFAULT 0,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
+		`CREATE TABLE IF NOT EXISTS service_endpoints (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			endpoint_id TEXT NOT NULL UNIQUE,
+			name TEXT NOT NULL DEFAULT '',
+			region TEXT NOT NULL DEFAULT '',
+			base_url TEXT NOT NULL DEFAULT '',
+			role TEXT NOT NULL DEFAULT 'data',
+			status TEXT NOT NULL DEFAULT 'offline',
+			version TEXT NOT NULL DEFAULT '',
+			capacity INTEGER NOT NULL DEFAULT 0,
+			heartbeat_at TIMESTAMP NULL,
+			last_seen_at TIMESTAMP NULL,
+			started_at TIMESTAMP NULL,
+			drained_at TIMESTAMP NULL,
+			revoked_at TIMESTAMP NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_service_endpoints_status ON service_endpoints(status);`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
