@@ -35,8 +35,10 @@ func TestUTLSConnCreationSetsIdleConnTimeout(t *testing.T) {
 	if tr.IdleConnTimeout == 0 {
 		t.Fatal("IdleConnTimeout 为 0：NewClientConn 会跳过空闲定时器安装")
 	}
-	if tr.ReadIdleTimeout == 0 {
-		t.Fatal("ReadIdleTimeout 为 0：无法感知被静默掐断的死连接")
+	// codexHTTP2ReadIdleTimeout 受 CODEX_HTTP2_READ_IDLE_TIMEOUT 控制（填 0 合法），
+	// 不能断言非 0，否则显式关闭主动 PING 的部署会在此误失败。
+	if tr.ReadIdleTimeout != codexHTTP2ReadIdleTimeout {
+		t.Fatalf("ReadIdleTimeout = %s, want %s（与生产变量一致）", tr.ReadIdleTimeout, codexHTTP2ReadIdleTimeout)
 	}
 }
 

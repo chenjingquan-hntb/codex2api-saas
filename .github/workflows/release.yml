@@ -65,7 +65,7 @@ jobs:
               binary_name="codex2api.exe"
             fi
 
-            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w -X github.com/codex2api/internal/version.Version=${VERSION} -X github.com/codex2api/internal/version.Commit=${commit} -X github.com/codex2api/internal/version.BuildTime=${build_time}" -o "$workdir/$binary_name" .
+            CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w -X github.com/codex2api/internal/version.Version=${version} -X github.com/codex2api/internal/version.Commit=${commit} -X github.com/codex2api/internal/version.BuildTime=${build_time}" -o "$workdir/$binary_name" .
 
             cp .env.example "$workdir/.env.example"
             cp README.md "$workdir/README.md"

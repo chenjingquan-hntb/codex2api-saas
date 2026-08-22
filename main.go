@@ -40,6 +40,19 @@ func migrateOnlyEnabled() bool {
 	return value == "1" || strings.EqualFold(value, "true")
 }
 
+// listenSemantics 把监听地址归一化为非敏感语义，供 /version 使用：
+// 避免把部署者配置的具体内网 IP 暴露到公开状态接口。
+func listenSemantics(addr string) string {
+	switch addr {
+	case "", "0.0.0.0", "::", "[::]":
+		return "any"
+	case "127.0.0.1", "::1", "[::1]":
+		return "loopback"
+	default:
+		return "specific"
+	}
+}
+
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Println("Codex2API v2 启动中...")
@@ -529,24 +542,28 @@ func main() {
 	})
 
 	// 版本与配置摘要：只返回非敏感字段，供运维定位版本/回滚轨迹与负载均衡探测。
-	// 注意：这里不输出数据库/Redis 凭据、上游账号、密钥或内部拓扑。
+	// 注意：这里不输出数据库/Redis 凭据、上游账号、密钥或内部拓扑；监听地址
+	// 归一化为 any/loopback/specific，避免泄露部署者配置的具体内网 IP。
 	r.GET("/version", func(c *gin.Context) {
 		info := version.Runtime()
-		c.JSON(200, gin.H{
-			"version":                 info.Version,
-			"commit":                  info.Commit,
-			"build_time":              info.BuildTime,
-			"go_version":              info.GoVersion,
-			"uptime_seconds":          int64(time.Since(startedAt).Seconds()),
+		resp := gin.H{
+			"version":        info.Version,
+			"commit":         info.Commit,
+			"go_version":     info.GoVersion,
+			"uptime_seconds": int64(time.Since(startedAt).Seconds()),
 			"config": gin.H{
-				"port":                   cfg.Port,
-				"bind_address":           cfg.BindAddress,
-				"database_driver":        cfg.Database.Label(),
-				"cache_driver":           cfg.Cache.Label(),
+				"port":                     cfg.Port,
+				"listen":                   listenSemantics(cfg.BindAddress),
+				"database_driver":          cfg.Database.Label(),
+				"cache_driver":             cfg.Cache.Label(),
 				"codex_upstream_transport": cfg.CodexUpstreamTransport,
-				"allow_anonymous_v1":     cfg.AllowAnonymousV1,
+				"allow_anonymous_v1":       cfg.AllowAnonymousV1,
 			},
-		})
+		}
+		if info.BuildTime != "" {
+			resp["build_time"] = info.BuildTime
+		}
+		c.JSON(200, resp)
 	})
 
 	// 6.5 启动安全状态自检 banner

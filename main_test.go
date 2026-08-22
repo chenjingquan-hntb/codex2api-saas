@@ -206,3 +206,25 @@ func TestLoggerMiddlewareUsesStreamingOutcomeOverride(t *testing.T) {
 		t.Fatalf("access log must use stream outcome override: %s", got)
 	}
 }
+
+func TestListenSemanticsNormalizesBindAddress(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", "any"},
+		{"0.0.0.0", "any"},
+		{"::", "any"},
+		{"[::]", "any"},
+		{"127.0.0.1", "loopback"},
+		{"::1", "loopback"},
+		{"[::1]", "loopback"},
+		{"192.168.1.10", "specific"},
+		{"10.0.0.5", "specific"},
+	}
+	for _, c := range cases {
+		if got := listenSemantics(c.in); got != c.want {
+			t.Errorf("listenSemantics(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
