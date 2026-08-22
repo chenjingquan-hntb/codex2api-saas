@@ -83,6 +83,12 @@ type Handler struct {
 	cacheDriver               string
 	cacheLabel                string
 	adminSecretEnv            string
+	userMailer                userMailer
+	registerLimiter           *keyedRateLimiter
+	loginIPLimiter            *keyedRateLimiter
+	loginEmailLimiter         *keyedRateLimiter
+	resendLimiter             *keyedRateLimiter
+	resetReqLimiter           *keyedRateLimiter
 	imageProxy                *proxy.Handler
 
 	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
@@ -932,6 +938,12 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		cacheDriver:          tc.Driver(),
 		cacheLabel:           tc.Label(),
 		adminSecretEnv:       adminSecretEnv,
+		userMailer:           logOnlyUserMailer{},
+		registerLimiter:      newKeyedRateLimiter(userRegisterRateLimit, userRegisterRateWin),
+		loginIPLimiter:       newKeyedRateLimiter(userLoginRateLimit, userLoginRateWin),
+		loginEmailLimiter:    newKeyedRateLimiter(userLoginEmailRateLimit, userLoginRateWin),
+		resendLimiter:        newKeyedRateLimiter(userResendRateLimit, userResendRateWin),
+		resetReqLimiter:      newKeyedRateLimiter(userResetReqRateLimit, userResetReqRateWin),
 		imageProxy:           proxy.NewHandler(store, db, nil, nil),
 		chartCacheData:       make(map[string]*chartCacheEntry),
 		accountListCache:     make(map[string]*accountListSnapshot),
@@ -993,6 +1005,24 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	imageStudioPortal.GET("/assets", h.ListPortalImageAssets)
 	imageStudioPortal.GET("/assets/:id/file", h.GetPortalImageAssetFile)
 	imageStudioPortal.DELETE("/assets/:id", h.DeletePortalImageAsset)
+
+	// 门户用户认证（P5/P6 控制面）。公开端点自带限流；
+	// 需登录端点走 requireUserSession（HttpOnly 会话 Cookie）。
+	authAPI := r.Group("/api/auth")
+	authAPI.POST("/register", h.RegisterUser)
+	authAPI.POST("/verify-email", h.VerifyEmail)
+	authAPI.POST("/resend-verification", h.ResendVerification)
+	authAPI.POST("/login", h.LoginUser)
+	authAPI.POST("/password-reset-request", h.RequestPasswordReset)
+	authAPI.POST("/password-reset", h.ResetPassword)
+
+	authAuthed := r.Group("/api/auth")
+	authAuthed.Use(h.requireUserSession())
+	authAuthed.POST("/logout", h.LogoutUser)
+	authAuthed.GET("/me", h.GetCurrentUser)
+	authAuthed.POST("/password", h.ChangePassword)
+	authAuthed.GET("/sessions", h.ListMySessions)
+	authAuthed.POST("/sessions/:id/revoke", h.RevokeSession)
 
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
 	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。
