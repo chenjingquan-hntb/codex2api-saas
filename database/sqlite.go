@@ -456,6 +456,92 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 		);`,
 		`DROP TABLE IF EXISTS prompt_filter_secrets;`,
+
+		// ==================== 用户与钱包（控制面，P5/P6） ====================
+		`CREATE TABLE IF NOT EXISTS users (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			email TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'pending',
+			role TEXT NOT NULL DEFAULT 'user',
+			auth_version INTEGER NOT NULL DEFAULT 0,
+			email_verified_at TIMESTAMP NULL,
+			last_login_at TIMESTAMP NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);`,
+		`CREATE TABLE IF NOT EXISTS user_sessions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			token_hash TEXT NOT NULL,
+			node_name TEXT DEFAULT '',
+			ip TEXT DEFAULT '',
+			user_agent TEXT DEFAULT '',
+			expires_at TIMESTAMP NOT NULL,
+			revoked_at TIMESTAMP NULL,
+			last_seen_at TIMESTAMP NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);`,
+		`CREATE INDEX IF NOT EXISTS idx_user_sessions_token_hash ON user_sessions(token_hash);`,
+		`CREATE TABLE IF NOT EXISTS user_email_verification_tokens (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			token_hash TEXT NOT NULL,
+			expires_at TIMESTAMP NOT NULL,
+			used_at TIMESTAMP NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_user_email_verification_user ON user_email_verification_tokens(user_id);`,
+		`CREATE TABLE IF NOT EXISTS user_password_reset_tokens (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			token_hash TEXT NOT NULL,
+			expires_at TIMESTAMP NOT NULL,
+			used_at TIMESTAMP NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_user_password_reset_user ON user_password_reset_tokens(user_id);`,
+		`CREATE TABLE IF NOT EXISTS wallet_accounts (
+			user_id INTEGER PRIMARY KEY,
+			currency TEXT NOT NULL DEFAULT 'CNY',
+			available_micro INTEGER NOT NULL DEFAULT 0,
+			reserved_micro INTEGER NOT NULL DEFAULT 0,
+			version INTEGER NOT NULL DEFAULT 0,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE TABLE IF NOT EXISTS wallet_ledger_entries (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			type TEXT NOT NULL,
+			amount_micro INTEGER NOT NULL,
+			balance_before_micro INTEGER NOT NULL,
+			balance_after_micro INTEGER NOT NULL,
+			reference_type TEXT DEFAULT '',
+			reference_id TEXT DEFAULT '',
+			idempotency_key TEXT NOT NULL UNIQUE,
+			operator_id INTEGER DEFAULT 0,
+			reason TEXT DEFAULT '',
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user_created ON wallet_ledger_entries(user_id, created_at);`,
+		`CREATE TABLE IF NOT EXISTS wallet_transactions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			user_id INTEGER NOT NULL,
+			order_no TEXT NOT NULL UNIQUE,
+			channel TEXT NOT NULL DEFAULT 'epay',
+			amount_micro INTEGER NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			pay_url TEXT DEFAULT '',
+			callback_payload TEXT DEFAULT '',
+			verified_at TIMESTAMP NULL,
+			expires_at TIMESTAMP NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user_created ON wallet_transactions(user_id, created_at);`,
 	}
 	for _, stmt := range statements {
 		if _, err := db.conn.ExecContext(ctx, stmt); err != nil {
@@ -524,6 +610,14 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"api_keys", "allowed_group_ids", "TEXT DEFAULT '[]'"},
 		{"api_keys", "limits", "TEXT DEFAULT '{}'"},
 		{"api_keys", "expires_at", "TIMESTAMP NULL"},
+		{"api_keys", "user_id", "INTEGER NOT NULL DEFAULT 0"},
+		{"api_keys", "key_hash", "TEXT DEFAULT ''"},
+		{"api_keys", "key_prefix", "TEXT DEFAULT ''"},
+		{"api_keys", "status", "TEXT NOT NULL DEFAULT 'active'"},
+		{"api_keys", "revoked_at", "TIMESTAMP NULL"},
+		{"api_keys", "revoked_reason", "TEXT DEFAULT ''"},
+		{"api_keys", "last_used_at", "TIMESTAMP NULL"},
+		{"api_keys", "created_by", "INTEGER NOT NULL DEFAULT 0"},
 		{"account_groups", "description", "TEXT DEFAULT ''"},
 		{"account_groups", "color", "TEXT DEFAULT ''"},
 		{"account_groups", "sort_order", "INTEGER DEFAULT 0"},

@@ -1543,6 +1543,112 @@ func (db *DB) migrate(ctx context.Context) error {
 	);
 	CREATE INDEX IF NOT EXISTS idx_image_assets_created ON image_assets(created_at);
 	CREATE INDEX IF NOT EXISTS idx_image_assets_job_id ON image_assets(job_id);
+	-- ==================== 用户与钱包（控制面，P5/P6） ====================
+	-- 所有金额一律用整数微元（1e-7 元）表示，见 database/money.go；
+	-- 账本权威禁浮点，Redis 只做缓存/锁。
+
+	CREATE TABLE IF NOT EXISTS users (
+		id               BIGSERIAL PRIMARY KEY,
+		email            VARCHAR(320) NOT NULL UNIQUE,
+		password_hash    VARCHAR(255) NOT NULL DEFAULT '',
+		status           VARCHAR(16) NOT NULL DEFAULT 'pending',
+		role             VARCHAR(16) NOT NULL DEFAULT 'user',
+		auth_version     INT NOT NULL DEFAULT 0,
+		email_verified_at TIMESTAMPTZ NULL,
+		last_login_at    TIMESTAMPTZ NULL,
+		created_at       TIMESTAMPTZ DEFAULT NOW(),
+		updated_at       TIMESTAMPTZ DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
+
+	CREATE TABLE IF NOT EXISTS user_sessions (
+		id           BIGSERIAL PRIMARY KEY,
+		user_id      BIGINT NOT NULL,
+		token_hash   VARCHAR(64) NOT NULL,
+		node_name    VARCHAR(128) DEFAULT '',
+		ip           VARCHAR(64) DEFAULT '',
+		user_agent   TEXT DEFAULT '',
+		expires_at   TIMESTAMPTZ NOT NULL,
+		revoked_at   TIMESTAMPTZ NULL,
+		last_seen_at TIMESTAMPTZ NULL,
+		created_at   TIMESTAMPTZ DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id);
+	CREATE INDEX IF NOT EXISTS idx_user_sessions_token_hash ON user_sessions(token_hash);
+
+	CREATE TABLE IF NOT EXISTS user_email_verification_tokens (
+		id         BIGSERIAL PRIMARY KEY,
+		user_id    BIGINT NOT NULL,
+		token_hash VARCHAR(64) NOT NULL,
+		expires_at TIMESTAMPTZ NOT NULL,
+		used_at    TIMESTAMPTZ NULL,
+		created_at TIMESTAMPTZ DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_user_email_verification_user ON user_email_verification_tokens(user_id);
+
+	CREATE TABLE IF NOT EXISTS user_password_reset_tokens (
+		id         BIGSERIAL PRIMARY KEY,
+		user_id    BIGINT NOT NULL,
+		token_hash VARCHAR(64) NOT NULL,
+		expires_at TIMESTAMPTZ NOT NULL,
+		used_at    TIMESTAMPTZ NULL,
+		created_at TIMESTAMPTZ DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_user_password_reset_user ON user_password_reset_tokens(user_id);
+
+	CREATE TABLE IF NOT EXISTS wallet_accounts (
+		user_id         BIGINT PRIMARY KEY,
+		currency        VARCHAR(8) NOT NULL DEFAULT 'CNY',
+		available_micro BIGINT NOT NULL DEFAULT 0,
+		reserved_micro  BIGINT NOT NULL DEFAULT 0,
+		version         BIGINT NOT NULL DEFAULT 0,
+		created_at      TIMESTAMPTZ DEFAULT NOW(),
+		updated_at      TIMESTAMPTZ DEFAULT NOW()
+	);
+
+	CREATE TABLE IF NOT EXISTS wallet_ledger_entries (
+		id                   BIGSERIAL PRIMARY KEY,
+		user_id              BIGINT NOT NULL,
+		type                 VARCHAR(16) NOT NULL,
+		amount_micro         BIGINT NOT NULL,
+		balance_before_micro BIGINT NOT NULL,
+		balance_after_micro  BIGINT NOT NULL,
+		reference_type       VARCHAR(32) DEFAULT '',
+		reference_id         VARCHAR(128) DEFAULT '',
+		idempotency_key      VARCHAR(160) NOT NULL,
+		operator_id          BIGINT DEFAULT 0,
+		reason               TEXT DEFAULT '',
+		created_at           TIMESTAMPTZ DEFAULT NOW()
+	);
+	CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_ledger_idempotency ON wallet_ledger_entries(idempotency_key);
+	CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user_created ON wallet_ledger_entries(user_id, created_at);
+
+	CREATE TABLE IF NOT EXISTS wallet_transactions (
+		id               BIGSERIAL PRIMARY KEY,
+		user_id          BIGINT NOT NULL,
+		order_no         VARCHAR(64) NOT NULL UNIQUE,
+		channel          VARCHAR(32) NOT NULL DEFAULT 'epay',
+		amount_micro     BIGINT NOT NULL,
+		status           VARCHAR(16) NOT NULL DEFAULT 'pending',
+		pay_url          TEXT DEFAULT '',
+		callback_payload TEXT DEFAULT '',
+		verified_at      TIMESTAMPTZ NULL,
+		expires_at       TIMESTAMPTZ NULL,
+		created_at       TIMESTAMPTZ DEFAULT NOW(),
+		updated_at       TIMESTAMPTZ DEFAULT NOW()
+	);
+	CREATE INDEX IF NOT EXISTS idx_wallet_transactions_user_created ON wallet_transactions(user_id, created_at);
+
+	-- api_keys 归属用户与摘要化存储（旧明文 Key 双读迁移，不删旧列）
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS user_id BIGINT NOT NULL DEFAULT 0;
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_hash VARCHAR(64) DEFAULT '';
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS key_prefix VARCHAR(16) DEFAULT '';
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS status VARCHAR(16) NOT NULL DEFAULT 'active';
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ NULL;
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS revoked_reason TEXT DEFAULT '';
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ NULL;
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS created_by BIGINT NOT NULL DEFAULT 0;
+	CREATE INDEX IF NOT EXISTS idx_api_keys_user_id ON api_keys(user_id);
 	`
 	_, err := db.conn.ExecContext(ctx, query)
 	if err != nil {
