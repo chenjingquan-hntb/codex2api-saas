@@ -402,6 +402,21 @@ func (db *DB) RevokeUserSessionsExcept(ctx context.Context, userID, exceptSessio
 	return err
 }
 
+// TouchUserSession 更新会话活动时间并滑动过期（refresh 时调用）。
+// 幂等：会话不存在或已吊销时静默成功，由调用方的读取校验兜底。
+func (db *DB) TouchUserSession(ctx context.Context, sessionID int64, newExpiresAt time.Time) error {
+	if sessionID <= 0 {
+		return fmt.Errorf("users: touch session: invalid id")
+	}
+	_, err := db.conn.ExecContext(ctx,
+		`UPDATE user_sessions SET last_seen_at = $1, expires_at = $2 WHERE id = $3 AND revoked_at IS NULL`,
+		db.timeArg(time.Now().UTC()), db.timeArg(newExpiresAt), sessionID)
+	if err != nil {
+		return fmt.Errorf("users: touch session: %w", err)
+	}
+	return nil
+}
+
 // ListUserSessions 列出用户全部会话（按最近创建倒序）。
 func (db *DB) ListUserSessions(ctx context.Context, userID int64) ([]UserSession, error) {
 	rows, err := db.conn.QueryContext(ctx, `

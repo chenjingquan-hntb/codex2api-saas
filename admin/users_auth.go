@@ -151,7 +151,11 @@ func sessionFromGin(c *gin.Context) *database.UserSession {
 	return s
 }
 
-// requireUserSession 校验会话 Cookie 并注入用户会话到上下文。
+// requireUserSession 校验用户会话并注入用户会话到上下文。
+// 双路径：
+//  1. Authorization: Bearer <access_token>（无状态本地验签，零 DB 查询；新前端首选）
+//  2. 兼容路径：HttpOnly 会话 Cookie（查 DB，测试与旧前端继续可用）
+// 若带 Bearer 但无效，直接 401 不回落 Cookie，避免过期 token 被 Cookie 路径放行。
 func (h *Handler) requireUserSession() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if h == nil || h.db == nil {
@@ -159,6 +163,19 @@ func (h *Handler) requireUserSession() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		// 路径 1：Bearer Access Token（无状态）。
+		if tok := bearerAccessToken(c); tok != "" {
+			claims, err := verifyAccessToken(tok, time.Now())
+			if err != nil {
+				writeError(c, http.StatusUnauthorized, "会话已过期，请重新登录")
+				c.Abort()
+				return
+			}
+			c.Set(string(ctxKeyUserSession), accessClaimsToSession(claims))
+			c.Next()
+			return
+		}
+		// 路径 2：兼容 HttpOnly 会话 Cookie（查 DB）。
 		raw, err := c.Cookie(userSessionCookieName)
 		if err != nil || strings.TrimSpace(raw) == "" {
 			writeError(c, http.StatusUnauthorized, "未登录或会话已过期")
@@ -484,12 +501,52 @@ func (h *Handler) LoginUser(c *gin.Context) {
 	}
 	h.setUserSessionCookie(c, token)
 	security.SecurityAuditLog("USER_LOGIN_OK", "user_id="+strconv.FormatInt(user.ID, 10)+" session_id="+strconv.FormatInt(sessionID, 10)+" ip="+security.SanitizeLog(ip))
-	c.JSON(http.StatusOK, gin.H{
-		"user_id":  user.ID,
-		"email":    user.Email,
-		"role":     user.Role,
-		"verified": true,
-	})
+	accessToken, expiresIn, err := issueAccessToken(user.ID, sessionID, user.Role, user.Email, time.Now())
+	if err != nil {
+		// 会话已建立，仅 access token 签发失败不阻断登录（前端可 refresh 重取）。
+		log.Printf("签发 access token 失败: user_id=%d err=%v", user.ID, err)
+		accessToken, expiresIn = "", 0
+	}
+	c.JSON(http.StatusOK, accessTokenResponseBody(user, accessToken, expiresIn))
+}
+
+// RefreshUserSession POST /api/auth/refresh
+// 刷新 Cookie → 校验会话（DB）→ 滑动过期 + 记录活动 → 签发新 Access Token。
+// 不做 token 轮换：Cookie 值不变、仅重置 MaxAge，避免多标签页并发 refresh 竞争；
+// 防重放由 DB 会话吊销兜底（logout/改密/封禁即吊销）。
+func (h *Handler) RefreshUserSession(c *gin.Context) {
+	if h == nil || h.db == nil {
+		writeError(c, http.StatusServiceUnavailable, "服务未就绪")
+		return
+	}
+	raw, err := c.Cookie(userSessionCookieName)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		writeError(c, http.StatusUnauthorized, "会话已过期，请重新登录")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+	defer cancel()
+	sess, err := h.db.GetUserSessionByTokenHash(ctx, database.HashSessionToken(raw))
+	if err != nil || !sess.Valid(time.Now()) {
+		security.SecurityAuditLog("USER_REFRESH_REJECTED", "ip="+security.SanitizeLog(c.ClientIP()))
+		writeError(c, http.StatusUnauthorized, "会话已过期，请重新登录")
+		return
+	}
+	newExpiresAt := time.Now().Add(userSessionTTL)
+	if err := h.db.TouchUserSession(ctx, sess.ID, newExpiresAt); err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	accessToken, expiresIn, err := issueAccessToken(sess.UserID, sess.ID, sess.Role, sess.Email, time.Now())
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	// 重设 Cookie（MaxAge 重置为完整 TTL），前端无需感知。
+	h.setUserSessionCookie(c, raw)
+	user := &database.User{ID: sess.UserID, Email: sess.Email, Role: sess.Role}
+	security.SecurityAuditLog("USER_REFRESH_OK", "user_id="+strconv.FormatInt(sess.UserID, 10)+" session_id="+strconv.FormatInt(sess.ID, 10)+" ip="+security.SanitizeLog(c.ClientIP()))
+	c.JSON(http.StatusOK, accessTokenResponseBody(user, accessToken, expiresIn))
 }
 
 // LogoutUser POST /api/auth/logout

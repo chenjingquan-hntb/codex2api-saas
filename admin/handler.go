@@ -1032,6 +1032,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	authAPI.POST("/verify-email", h.VerifyEmail)
 	authAPI.POST("/resend-verification", h.ResendVerification)
 	authAPI.POST("/login", h.LoginUser)
+	authAPI.POST("/refresh", h.RefreshUserSession)
 	authAPI.POST("/password-reset-request", h.RequestPasswordReset)
 	authAPI.POST("/password-reset", h.ResetPassword)
 
