@@ -1050,10 +1050,21 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	authAuthed.GET("/wallet/orders", h.ListMyRechargeOrders)
 	authAuthed.GET("/wallet/orders/:order_no", h.GetMyRechargeOrder)
 	authAuthed.POST("/redeem", h.RedeemCode)
+	authAuthed.GET("/keys", h.ListMyAPIKeys)
+	authAuthed.POST("/keys", h.CreateMyAPIKey)
+	authAuthed.PATCH("/keys/:id", h.RenameMyAPIKey)
+	authAuthed.POST("/keys/:id/revoke", h.RevokeMyAPIKey)
+	authAuthed.GET("/keys/:id/usage", h.GetMyAPIKeyUsage)
+	authAuthed.GET("/usage", h.GetMyUsage)
+	authAuthed.GET("/usage/daily", h.GetMyDailyUsage)
+	authAuthed.GET("/ledger", h.ListMyLedger)
 
 	payAPI := r.Group("/api/pay")
 	payAPI.POST("/epay/notify", h.EpayNotify)
 	payAPI.GET("/epay/return", h.EpayReturn)
+
+	// 用户门户公开端点（无鉴权）：价格表。
+	r.GET("/api/public/model-pricing", h.GetPublicModelPricing)
 
 	// 首次初始化端点（无需鉴权，仅在系统未配置 ADMIN_SECRET 时可用）
 	// 这两个端点必须注册在 adminAuthMiddleware 之外，否则会被 fail-closed 拦截。

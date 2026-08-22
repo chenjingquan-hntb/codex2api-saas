@@ -1078,6 +1078,10 @@ func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool, error) {
 		log.Printf("查询 API Key 失败: %v", err)
 		return nil, false, err
 	}
+	// 双保险：DB 查询已按 active 过滤，此处再防御一次，避免未来查询放宽后放行已撤销 key。
+	if row.Status != "" && row.Status != database.APIKeyStatusActive {
+		return nil, false, nil
+	}
 	h.setAPIKeyRuntimeCache(row)
 	h.syncAPIKeyAllowedGroups(row)
 	return row, true, nil
@@ -1095,7 +1099,16 @@ func (h *Handler) resolveAPIKeyFromRuntimeCache(key string) (*database.APIKeyRow
 		return nil, false
 	}
 	if !ok || len(raw) == 0 {
-		return nil, false
+		// 用户自建 key 以摘要为缓存键，兼容历史明文键：双键都试一次。
+		hashed := database.HashAPIKeySecret(key)
+		raw, ok, err = h.cache.GetRuntime(ctx, apiKeyCacheNamespace, hashed)
+		if err != nil {
+			log.Printf("读取 API Key Redis 缓存失败: %v", err)
+			return nil, false
+		}
+		if !ok || len(raw) == 0 {
+			return nil, false
+		}
 	}
 	var record apiKeyRuntimeRecord
 	if err := json.Unmarshal(raw, &record); err != nil {
@@ -1133,7 +1146,12 @@ func (h *Handler) setAPIKeyRuntimeCache(row *database.APIKeyRow) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
-	if err := h.cache.SetRuntime(ctx, apiKeyCacheNamespace, row.Key, payload, apiKeyCacheTTL); err != nil {
+	// 缓存键：用户自建 key 用摘要（撤销时可按 row.Key 精确失效），历史 key 用明文。
+	cacheKey := row.Key
+	if row.KeyHash != "" {
+		cacheKey = row.KeyHash
+	}
+	if err := h.cache.SetRuntime(ctx, apiKeyCacheNamespace, cacheKey, payload, apiKeyCacheTTL); err != nil {
 		log.Printf("写入 API Key Redis 缓存失败: id=%d err=%v", row.ID, err)
 	}
 }

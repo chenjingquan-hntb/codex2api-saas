@@ -1735,6 +1735,12 @@ type APIKeyRow struct {
 	Name            string       `json:"name"`
 	Key             string       `json:"key"`
 	UserID          int64        `json:"user_id"`
+	KeyHash         string       `json:"key_hash"`
+	KeyPrefix       string       `json:"key_prefix"`
+	Status          string       `json:"status"`
+	RevokedAt       sql.NullTime `json:"revoked_at"`
+	RevokedReason   string       `json:"revoked_reason"`
+	LastUsedAt      sql.NullTime `json:"last_used_at"`
 	QuotaLimit      float64      `json:"quota_limit"`
 	QuotaUsed       float64      `json:"quota_used"`
 	TotalUsed       float64      `json:"total_used"`
@@ -1891,7 +1897,7 @@ type APIKeyUpdate struct {
 	LimitsSet          bool
 }
 
-const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}'), COALESCE(user_id, 0)`
+const apiKeySelectColumns = `id, name, key, created_at, COALESCE(quota_limit, 0), COALESCE(quota_used, 0), COALESCE(total_used, 0), COALESCE(reset_count, 0), last_reset_at, expires_at, COALESCE(allowed_group_ids, '[]'), COALESCE(limits, '{}'), COALESCE(user_id, 0), COALESCE(key_hash, ''), COALESCE(key_prefix, ''), COALESCE(status, 'active'), revoked_at, COALESCE(revoked_reason, ''), last_used_at`
 
 // ListAPIKeys 获取所有 API 密钥
 func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
@@ -1923,7 +1929,9 @@ func (db *DB) CountAPIKeys(ctx context.Context) (int, error) {
 
 // GetAPIKeyByValue 通过完整 API Key 查找元数据，用于鉴权热路径的按 key 缓存。
 func (db *DB) GetAPIKeyByValue(ctx context.Context, key string) (*APIKeyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT `+apiKeySelectColumns+` FROM api_keys WHERE key = $1`, key)
+	// 双条件查找兼容两代 key：老 key 明文存 key 列；用户自建 key 只存摘要
+	// （key 列与 key_hash 列均为 sha256），且只有 active 的 key 可被鉴权命中。
+	rows, err := db.conn.QueryContext(ctx, `SELECT `+apiKeySelectColumns+` FROM api_keys WHERE (key = $1 OR key_hash = $2) AND status = $3`, key, HashAPIKeySecret(key), APIKeyStatusActive)
 	if err != nil {
 		return nil, err
 	}

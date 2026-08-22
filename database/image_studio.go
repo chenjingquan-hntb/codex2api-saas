@@ -698,7 +698,8 @@ func scanAPIKeyRow(scanner interface {
 }) (*APIKeyRow, error) {
 	row := &APIKeyRow{}
 	var createdAtRaw, expiresAtRaw, lastResetAtRaw, allowedGroupsRaw, limitsRaw interface{}
-	if err := scanner.Scan(&row.ID, &row.Name, &row.Key, &createdAtRaw, &row.QuotaLimit, &row.QuotaUsed, &row.TotalUsed, &row.ResetCount, &lastResetAtRaw, &expiresAtRaw, &allowedGroupsRaw, &limitsRaw, &row.UserID); err != nil {
+	var revokedAtRaw, lastUsedAtRaw interface{}
+	if err := scanner.Scan(&row.ID, &row.Name, &row.Key, &createdAtRaw, &row.QuotaLimit, &row.QuotaUsed, &row.TotalUsed, &row.ResetCount, &lastResetAtRaw, &expiresAtRaw, &allowedGroupsRaw, &limitsRaw, &row.UserID, &row.KeyHash, &row.KeyPrefix, &row.Status, &revokedAtRaw, &row.RevokedReason, &lastUsedAtRaw); err != nil {
 		return nil, err
 	}
 	createdAt, err := parseDBTimeValue(createdAtRaw)
@@ -716,6 +717,12 @@ func scanAPIKeyRow(scanner interface {
 	row.CreatedAt = createdAt
 	row.ExpiresAt = expiresAt
 	row.LastResetAt = lastResetAt
+	if t, err := parseDBNullTimeValue(revokedAtRaw); err == nil {
+		row.RevokedAt = t
+	}
+	if t, err := parseDBNullTimeValue(lastUsedAtRaw); err == nil {
+		row.LastUsedAt = t
+	}
 	row.AllowedGroupIDs = decodeInt64SliceValue(allowedGroupsRaw)
 	row.Limits = decodeAPIKeyLimits(limitsRaw)
 	return row, nil
