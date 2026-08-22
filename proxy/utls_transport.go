@@ -90,11 +90,36 @@ type utlsRoundTripper struct {
 	connections map[string]*utlsConn  // HTTP/2 连接池，按 host 索引
 	pending     map[string]*sync.Cond // 防止重复连接创建
 	dialer      xproxy.Dialer         // 底层拨号器（支持代理）
+	h2          *http2.Transport      // 自管连接池复用的 h2 transport（建连时只读）
 }
 
 // utlsSessionCache 在所有 uTLS 连接间共享 TLS 会话缓存，让重连走 TLS resumption。
 // 必须实例级共享（而非每次 new），否则缓存无法命中。
 var utlsSessionCache = utls.NewLRUClientSessionCache(256)
+
+// newSelfManagedHTTP2Transport 构造并配置自管连接池复用的 *http2.Transport。
+//
+// uTLS 自管连接池不经标准库 *http.Transport 的连接池，历史实现每条连接都 new
+// 一个 http2.Transport。Go 1.27 起 http2.Transport 包裹 net/http.Transport，
+// 每条连接会拖带一整套 *http.Transport 及其内部 h2 transport 直到连接关闭，
+// 在 issue #446 的万级连接场景下会放大分配。改为在 roundtripper 构造时配置
+// 一次并复用同一个实例（这些字段只在建连前写一次、之后只读，无并发写）。
+//
+// 与 enableCodexHTTP2KeepAlive 同理，必须经 http2.ConfigureTransports 绑定底层
+// transport，否则 Go 1.27 下 NewClientConn 会因内部 t1 为 nil 而 panic。
+// 对全新 &http.Transport{}，两个实现下 ConfigureTransports 都不会失败。
+func newSelfManagedHTTP2Transport(readIdle, ping, idleConn time.Duration) *http2.Transport {
+	t1 := &http.Transport{}
+	tr, err := http2.ConfigureTransports(t1)
+	if err != nil {
+		// 防御性分支：全新 transport 不应失败；失败时返回 nil，由调用方降级。
+		return nil
+	}
+	tr.ReadIdleTimeout = readIdle
+	tr.PingTimeout = ping
+	tr.IdleConnTimeout = idleConn
+	return tr
+}
 
 // NewUTLSTransport 创建使用 Chrome TLS 指纹的 RoundTripper
 // 支持 HTTP(S) 和 SOCKS5 代理
@@ -115,6 +140,8 @@ func NewUTLSTransport(proxyURL string) http.RoundTripper {
 		connections: make(map[string]*utlsConn),
 		pending:     make(map[string]*sync.Cond),
 		dialer:      dialer,
+		h2: newSelfManagedHTTP2Transport(
+			codexHTTP2ReadIdleTimeout, codexHTTP2PingTimeout, codexUTLSIdleConnTimeout),
 	}
 }
 
@@ -349,29 +376,22 @@ func (t *utlsRoundTripper) createConnection(host, addr string) (*http2.ClientCon
 		return nil, fmt.Errorf("TLS 握手失败: %w", err)
 	}
 
-	// 4. 创建 HTTP/2 连接
+	// 4. 创建 HTTP/2 连接（复用 roundtripper 上共享的 *http2.Transport）
 	// 启用保活 PING（ReadIdleTimeout/PingTimeout）：uTLS 自管连接池，池化连接
 	// 被代理/NAT 静默掐断后无法被感知，请求会挂到 TCP 重传超时。开启后空闲连接
 	// 主动发 PING，探测失败即在读循环里报错，触发上层从池中剔除并重建。
-	//
-	// IdleConnTimeout 必须显式设置：NewClientConn 仅在 idleConnTimeout()!=0 时安装
-	// 空闲定时器（closeIfIdle）。缺失时连接永不自动回收，readLoop goroutine 与
-	// socket 常驻，是 issue #446 万级连接/goroutine 泄漏的根因。
-	//
-	// Go 1.27 起 x/net/http2 将 http2.Transport 改为包裹 net/http.Transport，
-	// NewClientConn 会经内部 t1 走标准库 NewClientConn；直接用 &http2.Transport{}
-	// 时 t1 为 nil，会触发 nil pointer panic。必须通过 http2.ConfigureTransports
-	// 拿到与底层 *http.Transport 绑定的实例（与 enableCodexHTTP2KeepAlive 同款）。
-	t1 := &http.Transport{}
-	tr, err := http2.ConfigureTransports(t1)
-	if err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("HTTP/2 配置失败: %w", err)
+	// IdleConnTimeout 必须在建连前配置：NewClientConn 仅在 idleConnTimeout()!=0 时
+	// 安装空闲定时器（closeIfIdle），缺失时连接永不自动回收（issue #446 根因）。
+	h2 := t.h2
+	if h2 == nil {
+		// 防御性回退：正常情况下构造器已建好共享实例。
+		h2 = newSelfManagedHTTP2Transport(codexHTTP2ReadIdleTimeout, codexHTTP2PingTimeout, codexUTLSIdleConnTimeout)
 	}
-	tr.ReadIdleTimeout = codexHTTP2ReadIdleTimeout
-	tr.PingTimeout = codexHTTP2PingTimeout
-	tr.IdleConnTimeout = codexUTLSIdleConnTimeout
-	h2Conn, err := tr.NewClientConn(tlsConn)
+	if h2 == nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("HTTP/2 配置失败")
+	}
+	h2Conn, err := h2.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()
 		return nil, fmt.Errorf("HTTP/2 连接创建失败: %w", err)

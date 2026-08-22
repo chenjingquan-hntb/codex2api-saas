@@ -27,6 +27,7 @@ type utlsAuthRoundTripper struct {
 	connections map[string]*http2.ClientConn
 	pending     map[string]*sync.Cond
 	dialer      xproxy.Dialer
+	h2          *http2.Transport // 自管连接池复用的 h2 transport（建连时只读）
 }
 
 const (
@@ -34,6 +35,22 @@ const (
 	utlsAuthPingTimeout     = 15 * time.Second
 	utlsAuthIdleConnTimeout = 90 * time.Second
 )
+
+// newSelfManagedAuthHTTP2Transport 构造并配置自管连接池复用的 *http2.Transport。
+// Go 1.27 起必须经 http2.ConfigureTransports 绑定底层 net/http.Transport，
+// 否则 NewClientConn 会因内部 t1 为 nil 而 panic。复用单个实例避免每条连接
+// 都拖带一整套 *http.Transport（字段仅在构造时写一次，之后只读）。
+func newSelfManagedAuthHTTP2Transport(readIdle, ping, idleConn time.Duration) *http2.Transport {
+	t1 := &http.Transport{}
+	tr, err := http2.ConfigureTransports(t1)
+	if err != nil {
+		return nil
+	}
+	tr.ReadIdleTimeout = readIdle
+	tr.PingTimeout = ping
+	tr.IdleConnTimeout = idleConn
+	return tr
+}
 
 func newUTLSAuthTransport(proxyURL string) http.RoundTripper {
 	var dialer xproxy.Dialer = xproxy.Direct
@@ -49,6 +66,8 @@ func newUTLSAuthTransport(proxyURL string) http.RoundTripper {
 		connections: make(map[string]*http2.ClientConn),
 		pending:     make(map[string]*sync.Cond),
 		dialer:      dialer,
+		h2: newSelfManagedAuthHTTP2Transport(
+			utlsAuthReadIdleTimeout, utlsAuthPingTimeout, utlsAuthIdleConnTimeout),
 	}
 }
 
@@ -115,22 +134,17 @@ func (t *utlsAuthRoundTripper) createConnection(host, addr string) (*http2.Clien
 	}
 
 	// 认证 transport 自管 HTTP/2 连接，不经过 net/http 的连接池。三项超时
-	// 必须直接配置在 http2.Transport 上：否则健康空闲连接不会安装回收计时器，
-	// readLoop、socket 与缓冲区会一直驻留。
-	//
-	// Go 1.27 起 x/net/http2 把 http2.Transport 改为包裹 net/http.Transport，
-	// NewClientConn 经内部 t1 走标准库；直接 &http2.Transport{} 会因 t1 为 nil
-	// 而 panic，必须用 http2.ConfigureTransports 拿到绑定底层 transport 的实例。
-	t1 := &http.Transport{}
-	tr, err := http2.ConfigureTransports(t1)
-	if err != nil {
-		tlsConn.Close()
-		return nil, fmt.Errorf("HTTP/2 配置失败: %w", err)
+	// 必须在建连前配置到共享的 http2.Transport 上：否则健康空闲连接不会安装
+	// 回收计时器，readLoop、socket 与缓冲区会一直驻留。
+	h2 := t.h2
+	if h2 == nil {
+		h2 = newSelfManagedAuthHTTP2Transport(utlsAuthReadIdleTimeout, utlsAuthPingTimeout, utlsAuthIdleConnTimeout)
 	}
-	tr.ReadIdleTimeout = utlsAuthReadIdleTimeout
-	tr.PingTimeout = utlsAuthPingTimeout
-	tr.IdleConnTimeout = utlsAuthIdleConnTimeout
-	h2Conn, err := tr.NewClientConn(tlsConn)
+	if h2 == nil {
+		tlsConn.Close()
+		return nil, fmt.Errorf("HTTP/2 配置失败")
+	}
+	h2Conn, err := h2.NewClientConn(tlsConn)
 	if err != nil {
 		tlsConn.Close()
 		return nil, fmt.Errorf("HTTP/2 连接创建失败: %w", err)

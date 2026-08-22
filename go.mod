@@ -1,6 +1,6 @@
 module github.com/codex2api
 
-go 1.26.6
+go 1.27
 
 require (
 	github.com/andybalholm/brotli v1.0.6
