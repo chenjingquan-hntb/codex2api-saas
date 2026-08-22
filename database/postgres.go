@@ -1063,6 +1063,8 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS channel VARCHAR(16) DEFAULT 'codex';
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
 	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
+	-- P7.3：端点授权（endpoint_ids 为允许使用该分组的端点 ID 数组，空 = 全端点可见）。
+	ALTER TABLE account_groups ADD COLUMN IF NOT EXISTS endpoint_ids JSONB DEFAULT '[]'::jsonb;
 
 	CREATE TABLE IF NOT EXISTS account_group_members (
 		account_id BIGINT NOT NULL,
@@ -1471,6 +1473,9 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_location VARCHAR(255) DEFAULT '';
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_latency_ms INT DEFAULT 0;
 	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS test_status VARCHAR(20) NOT NULL DEFAULT 'untested';
+	-- P7.4：出口池地区/优先级（region 空 = 通用兜底；priority 越大越优先）。
+	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS region VARCHAR(50) NOT NULL DEFAULT '';
+	ALTER TABLE proxies ADD COLUMN IF NOT EXISTS priority INT NOT NULL DEFAULT 0;
 	UPDATE proxies
 	SET test_status = 'success'
 	WHERE COALESCE(test_status, 'untested') = 'untested'
@@ -3232,6 +3237,9 @@ type ProxyRow struct {
 	TestLocation  string    `json:"test_location"`
 	TestLatencyMs int       `json:"test_latency_ms"`
 	TestStatus    string    `json:"test_status"`
+	// P7.4：出口池地区与优先级（region 空 = 通用兜底；priority 越大越优先）。
+	Region   string `json:"region"`
+	Priority int    `json:"priority"`
 	// BoundCount 是绑定到该代理的账号数,由列表接口按 proxy_url 聚合填充,
 	// 前端据此免拉全量账号(代理页大号池卡死问题)。
 	BoundCount int64 `json:"bound_count"`
@@ -3296,7 +3304,7 @@ func (db *DB) CountAccountsByProxyURL(ctx context.Context) (map[string]int64, er
 
 // ListProxies 获取所有代理
 func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0), COALESCE(test_status,'untested') FROM proxies ORDER BY id`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0), COALESCE(test_status,'untested'), COALESCE(region,''), COALESCE(priority,0) FROM proxies ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -3306,7 +3314,7 @@ func (db *DB) ListProxies(ctx context.Context) ([]*ProxyRow, error) {
 	for rows.Next() {
 		p := &ProxyRow{}
 		var createdAtRaw interface{}
-		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs, &p.TestStatus); err != nil {
+		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs, &p.TestStatus, &p.Region, &p.Priority); err != nil {
 			return nil, err
 		}
 		p.CreatedAt, err = parseDBTimeValue(createdAtRaw)
@@ -3325,7 +3333,8 @@ func (db *DB) GetProxy(ctx context.Context, id int64) (*ProxyRow, error) {
 	err := db.conn.QueryRowContext(ctx, `
 		SELECT id, url, label, enabled, created_at,
 		       COALESCE(test_ip,''), COALESCE(test_location,''),
-		       COALESCE(test_latency_ms,0), COALESCE(test_status,'untested')
+		       COALESCE(test_latency_ms,0), COALESCE(test_status,'untested'),
+		       COALESCE(region,''), COALESCE(priority,0)
 		FROM proxies
 		WHERE id = $1
 	`, id).Scan(
@@ -3338,6 +3347,8 @@ func (db *DB) GetProxy(ctx context.Context, id int64) (*ProxyRow, error) {
 		&p.TestLocation,
 		&p.TestLatencyMs,
 		&p.TestStatus,
+		&p.Region,
+		&p.Priority,
 	)
 	if err != nil {
 		return nil, err
@@ -3357,7 +3368,8 @@ func (db *DB) ListProxiesByIDs(ctx context.Context, ids []int64) ([]*ProxyRow, e
 	query := fmt.Sprintf(`
 		SELECT id, url, label, enabled, created_at,
 		       COALESCE(test_ip,''), COALESCE(test_location,''),
-		       COALESCE(test_latency_ms,0), COALESCE(test_status,'untested')
+		       COALESCE(test_latency_ms,0), COALESCE(test_status,'untested'),
+		       COALESCE(region,''), COALESCE(priority,0)
 		FROM proxies
 		WHERE id IN (%s)
 		ORDER BY id
@@ -3382,6 +3394,8 @@ func (db *DB) ListProxiesByIDs(ctx context.Context, ids []int64) ([]*ProxyRow, e
 			&p.TestLocation,
 			&p.TestLatencyMs,
 			&p.TestStatus,
+			&p.Region,
+			&p.Priority,
 		); err != nil {
 			return nil, err
 		}
@@ -3396,9 +3410,9 @@ func (db *DB) ListProxiesByIDs(ctx context.Context, ids []int64) ([]*ProxyRow, e
 
 // ListEnabledProxies 获取已启用的代理
 func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
-	query := `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0), COALESCE(test_status,'untested') FROM proxies WHERE enabled = true AND COALESCE(test_status,'untested') <> 'error' ORDER BY id`
+	query := `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0), COALESCE(test_status,'untested'), COALESCE(region,''), COALESCE(priority,0) FROM proxies WHERE enabled = true AND COALESCE(test_status,'untested') <> 'error' ORDER BY priority DESC, id`
 	if db.isSQLite() {
-		query = `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0), COALESCE(test_status,'untested') FROM proxies WHERE enabled = 1 AND COALESCE(test_status,'untested') <> 'error' ORDER BY id`
+		query = `SELECT id, url, label, enabled, created_at, COALESCE(test_ip,''), COALESCE(test_location,''), COALESCE(test_latency_ms,0), COALESCE(test_status,'untested'), COALESCE(region,''), COALESCE(priority,0) FROM proxies WHERE enabled = 1 AND COALESCE(test_status,'untested') <> 'error' ORDER BY priority DESC, id`
 	}
 	rows, err := db.conn.QueryContext(ctx, query)
 	if err != nil {
@@ -3410,7 +3424,7 @@ func (db *DB) ListEnabledProxies(ctx context.Context) ([]*ProxyRow, error) {
 	for rows.Next() {
 		p := &ProxyRow{}
 		var createdAtRaw interface{}
-		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs, &p.TestStatus); err != nil {
+		if err := rows.Scan(&p.ID, &p.URL, &p.Label, &p.Enabled, &createdAtRaw, &p.TestIP, &p.TestLocation, &p.TestLatencyMs, &p.TestStatus, &p.Region, &p.Priority); err != nil {
 			return nil, err
 		}
 		p.CreatedAt, err = parseDBTimeValue(createdAtRaw)
@@ -3545,6 +3559,37 @@ func (db *DB) UpdateProxy(ctx context.Context, id int64, urlValue *string, label
 		return err
 	}
 	if affected == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// SetProxyRouting 更新代理的 P7.4 路由字段（region/priority）。nil 指针表示不修改。
+func (db *DB) SetProxyRouting(ctx context.Context, id int64, region *string, priority *int) error {
+	if region == nil && priority == nil {
+		return nil
+	}
+	assignments := make([]string, 0, 2)
+	args := make([]interface{}, 0, 3)
+	if region != nil {
+		args = append(args, strings.TrimSpace(*region))
+		assignments = append(assignments, fmt.Sprintf("region = $%d", len(args)))
+	}
+	if priority != nil {
+		args = append(args, *priority)
+		assignments = append(assignments, fmt.Sprintf("priority = $%d", len(args)))
+	}
+	args = append(args, id)
+	query := fmt.Sprintf("UPDATE proxies SET %s WHERE id = $%d", strings.Join(assignments, ", "), len(args))
+	res, err := db.conn.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
 		return sql.ErrNoRows
 	}
 	return nil
@@ -6238,6 +6283,52 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	return db.ListActiveByChannel(ctx, "")
 }
 
+// ListActiveByChannelForEndpoint 按端点授权过滤的账号加载：仅返回"分组允许本端点"
+// 的账号（P7.3）。endpointID 为空退化为 ListActiveByChannel（单机/未配置端点模式）。
+// 数据面节点用它做凭证/账号的按端点隔离：端点看不到也不持有授权范围外的账号。
+func (db *DB) ListActiveByChannelForEndpoint(ctx context.Context, channel, endpointID string) ([]*AccountRow, error) {
+	endpointID = strings.TrimSpace(endpointID)
+	if endpointID == "" {
+		return db.ListActiveByChannel(ctx, channel)
+	}
+	channel = strings.ToLower(strings.TrimSpace(channel))
+	where := `status <> 'deleted' AND COALESCE(error_message, '') <> 'deleted'`
+	switch channel {
+	case UpstreamChannelAnthropic:
+		if db.isSQLite() {
+			where += ` AND LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) = 'anthropic'`
+		} else {
+			where += ` AND LOWER(COALESCE(credentials->>'upstream_type', '')) = 'anthropic'`
+		}
+	case UpstreamChannelGrok:
+		if db.isSQLite() {
+			where += ` AND LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) = 'grok'`
+		} else {
+			where += ` AND LOWER(COALESCE(credentials->>'upstream_type', '')) = 'grok'`
+		}
+	case UpstreamChannelCodex:
+		if db.isSQLite() {
+			where += ` AND LOWER(COALESCE(json_extract(credentials, '$.upstream_type'), '')) NOT IN ('grok', 'anthropic')`
+		} else {
+			where += ` AND LOWER(COALESCE(credentials->>'upstream_type', '')) NOT IN ('grok', 'anthropic')`
+		}
+	}
+	where += endpointFilterClauseForEndpoint(endpointID, db.isSQLite())
+
+	query := `
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(enabled, true), COALESCE(locked, false), COALESCE(credit_enabled, false), COALESCE(credit_skip_usage_window, false), COALESCE(skip_warm_tier, false), score_bias_override, base_concurrency_override, COALESCE(tags, '[]'), COALESCE(note, ''), created_at, updated_at, COALESCE(credential_generation, 1), COALESCE(credential_family_id, '')
+		FROM accounts
+		WHERE ` + where + `
+		ORDER BY id
+	`
+	rows, err := db.conn.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("查询账号失败(endpoint=%s): %w", endpointID, err)
+	}
+	defer rows.Close()
+	return scanAccountRows(rows)
+}
+
 // ListActiveByChannel 返回未删除账号；channel 为空返回全部，
 // "grok" 仅 Grok 上游，"codex" 为非 Grok（含默认 Codex / OpenAI Responses 等）。
 // 过滤依据 credentials.upstream_type，与管理后台列表的 grok_api 判定一致。
@@ -6277,7 +6368,15 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 		return nil, fmt.Errorf("查询账号失败: %w", err)
 	}
 	defer rows.Close()
+	return scanAccountRows(rows)
+}
 
+// scanAccountRows 扫描 ListActive* 的公共行投影（列序见调用方 SELECT）。
+func scanAccountRows(rows interface {
+	Next() bool
+	Scan(...interface{}) error
+	Err() error
+}) ([]*AccountRow, error) {
 	var accounts []*AccountRow
 	for rows.Next() {
 		a := &AccountRow{}
@@ -6315,6 +6414,7 @@ func (db *DB) ListActiveByChannel(ctx context.Context, channel string) ([]*Accou
 		}
 		a.Credentials = decodeCredentials(credRaw)
 		a.Tags = decodeTagsValue(tagsRaw)
+		var err error
 		a.CooldownUntil, err = parseDBNullTimeValue(cooldownUntilRaw)
 		if err != nil {
 			return nil, fmt.Errorf("解析 cooldown_until 失败: %w", err)

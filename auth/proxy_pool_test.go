@@ -506,3 +506,35 @@ func TestProxyPoolStartStop(t *testing.T) {
 	// 停止
 	pool.Stop()
 }
+
+// TestSelectFilteredRegionPriority 验证 P7.4 地区/优先级路由：同区代理优先（优先级高者先），
+// 无同区时通用（region 空）兜底，其他地区不参与。
+func TestSelectFilteredRegionPriority(t *testing.T) {
+	pool := NewProxyPool(nil)
+	pool.AddProxyWithRouting("http://sg-high:8080", 10, "sg", 100)
+	pool.AddProxyWithRouting("http://sg-low:8080", 10, "sg", 1)
+	pool.AddProxyWithRouting("http://hk:8080", 10, "hk", 50)
+	pool.AddProxyWithRouting("http://generic:8080", 10, "", 0)
+
+	// 同区优先级：多次选择都应命中 sg 且优先 high。
+	for i := 0; i < 5; i++ {
+		e := pool.SelectFiltered(func(pe *ProxyEntry) bool { return pe.Region == "sg" })
+		if e == nil || e.Region != "sg" {
+			t.Fatalf("sg select = %+v", e)
+		}
+		if e.Priority != 100 {
+			t.Fatalf("sg select priority = %d, want 100 (highest)", e.Priority)
+		}
+	}
+
+	// 通用兜底：只给 region 空。
+	e := pool.SelectFiltered(func(pe *ProxyEntry) bool { return pe.Region == "" })
+	if e == nil || e.URL != "http://generic:8080" {
+		t.Fatalf("generic select = %+v", e)
+	}
+
+	// 不存在的地区：返回 nil。
+	if e := pool.SelectFiltered(func(pe *ProxyEntry) bool { return pe.Region == "tokyo" }); e != nil {
+		t.Fatalf("tokyo select = %+v, want nil", e)
+	}
+}

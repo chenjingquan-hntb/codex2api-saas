@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -43,6 +45,48 @@ const (
 	walletFinalizeTimeout = 5 * time.Second
 	walletOpTimeout       = 3 * time.Second
 )
+
+// WalletWriteMode 钱包写分区模式（P7.6）。
+//
+//	Shared  （默认/推荐）：全部端点写同一共享主库，walletApplyTx 条件更新 + PG 行锁
+//	          串行化并发，任何节点扣费都是库中最新的余额，透支不可能（财务一致性最优）。
+//	Primary ：主区形态（预留接口）：仅主区端点执行钱包写，其余端点只读（计费预留
+//	          返回 503 不可用）。用于跨洲部署时把写收敛到主区、避免跨洋写放大；
+//	          非主区节点需在结算异步化（L3）落地后配合使用。
+const (
+	WalletWriteModeShared  = "shared"
+	WalletWriteModePrimary = "primary"
+)
+
+// walletWriteMode 返回当前钱包写模式（env CODEX_WALLET_WRITE_MODE，默认 shared）。
+// 未知值回落 shared（fail-safe：绝不默认放行不可验证的模式）。
+func walletWriteMode() string {
+	mode := strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_WALLET_WRITE_MODE")))
+	switch mode {
+	case WalletWriteModePrimary:
+		return mode
+	default:
+		return WalletWriteModeShared
+	}
+}
+
+// walletWriteEnabled 判断本端点是否允许执行钱包写（P7.6）。
+// primary 模式下仅主区端点（CODEX_WALLET_PRIMARY_REGION 命中本端点地区）可写；
+// shared 模式全端点可写。
+func walletWriteEnabled() bool {
+	if walletWriteMode() == WalletWriteModeShared {
+		return true
+	}
+	region := strings.TrimSpace(os.Getenv("CODEX_ENDPOINT_REGION"))
+	primary := strings.TrimSpace(os.Getenv("CODEX_WALLET_PRIMARY_REGION"))
+	return primary != "" && region != "" && region == primary
+}
+
+// WalletWriteMode 导出当前钱包写模式（/healthz 等展示用）。
+func WalletWriteMode() string { return walletWriteMode() }
+
+// WalletWriteEnabled 导出本端点是否可写钱包（/healthz 展示用）。
+func WalletWriteEnabled() bool { return walletWriteEnabled() }
 
 // walletBillingConfigCache 进程内计费配置缓存（管理页改动最多一个 TTL 生效）。
 type walletBillingConfigCache struct {
@@ -137,6 +181,15 @@ func (h *Handler) walletBeginBilling(c *gin.Context, row *database.APIKeyRow) bo
 		return false
 	}
 	if cfg == nil || !cfg.Enabled {
+		return false
+	}
+	// P7.6：钱包写分区决策。primary 模式下非主区端点不执行钱包写（fail-closed 503）。
+	if !walletWriteEnabled() {
+		security.SecurityAuditLog("WALLET_WRITE_READONLY",
+			fmt.Sprintf("user_id=%d path=%s ip=%s mode=%s", row.UserID, c.Request.URL.Path,
+				c.ClientIP(), walletWriteMode()))
+		api.SendError(c, api.ErrServiceUnavailable)
+		c.Abort()
 		return false
 	}
 	deposit := cfg.DepositMicro

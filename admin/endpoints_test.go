@@ -3,6 +3,7 @@ package admin
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -194,5 +195,127 @@ func TestEndpointBadRequests(t *testing.T) {
 	r.ServeHTTP(rec2, req)
 	if rec2.Code != http.StatusUnauthorized {
 		t.Fatalf("bad token status = %d", rec2.Code)
+	}
+}
+
+// ==================== P7.3/P7.5/P7.6 集成测试 ====================
+
+func TestAdminGroupEndpointBindingAndOverview(t *testing.T) {
+	h, db := newEndpointTestHandler(t)
+
+	// 建两个分组 + 两个端点。
+	rec := doAdmin(t, h, http.MethodPost, "/api/admin/account-groups", `{"name":"HK Group"}`)
+	if rec.Code != http.StatusOK && rec.Code != http.StatusCreated {
+		t.Fatalf("create group status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	groupID := gjson.Get(rec.Body.String(), "id").Int()
+	if groupID <= 0 {
+		t.Fatalf("group id = %d body=%s", groupID, rec.Body.String())
+	}
+	if _, err := h.db.RegisterServiceEndpoint(t.Context(), database.ServiceEndpoint{
+		EndpointID: "hk-01", Region: "hk", Role: "data"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// PATCH 分组绑定端点（P7.3）。
+	rec = doAdmin(t, h, http.MethodPatch, "/api/admin/account-groups/"+strconv.FormatInt(groupID, 10),
+		`{"endpoint_ids":["hk-01"]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bind status = %d body=%s", rec.Code, rec.Body.String())
+	}
+
+	// 分组列表携带 endpoint_ids。
+	rec = doAdmin(t, h, http.MethodGet, "/api/admin/account-groups", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("groups list status = %d", rec.Code)
+	}
+	found := false
+	raw := rec.Body.String()
+	// 分组列表字段结构：groups[].endpoint_ids。
+	groupsJSON := gjson.Get(raw, "groups")
+	if groupsJSON.Exists() {
+		groupsJSON.ForEach(func(key, value gjson.Result) bool {
+			if value.Get("id").Int() == groupID &&
+				value.Get("endpoint_ids.0").String() == "hk-01" {
+				found = true
+			}
+			return true
+		})
+	}
+	if !found {
+		t.Fatalf("group endpoint_ids not in list: %s", raw)
+	}
+
+	// 端点列表携带 bound_groups（P7.5）。
+	rec = doAdmin(t, h, http.MethodGet, "/api/admin/endpoints", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("endpoints list status = %d", rec.Code)
+	}
+	epJSON := gjson.Get(rec.Body.String(), "endpoints")
+	if !epJSON.Exists() || !epJSON.Get("0.bound_groups").Exists() {
+		t.Fatalf("endpoints list missing bound_groups: %s", rec.Body.String())
+	}
+	if got := epJSON.Get("0.bound_group_count").Int(); got < 1 {
+		t.Fatalf("bound_group_count = %d", got)
+	}
+
+	// 端点 overview（P7.5）。
+	rec = doAdmin(t, h, http.MethodGet, "/api/admin/endpoints/hk-01/overview", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("overview status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if got := gjson.Get(rec.Body.String(), "allowed_group_ids.#").Int(); got < 1 {
+		t.Fatalf("allowed_group_ids = %s", rec.Body.String())
+	}
+	if got := gjson.Get(rec.Body.String(), "wallet_write").String(); got == "" {
+		t.Fatalf("wallet_write missing: %s", rec.Body.String())
+	}
+
+	// 清空绑定 = 全端点。
+	rec = doAdmin(t, h, http.MethodPatch, "/api/admin/account-groups/"+strconv.FormatInt(groupID, 10),
+		`{"endpoint_ids":[]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("unbind status = %d", rec.Code)
+	}
+	// 非法端点 ID → 400。
+	rec = doAdmin(t, h, http.MethodPatch, "/api/admin/account-groups/"+strconv.FormatInt(groupID, 10),
+		`{"endpoint_ids":["bad id with space"]}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("invalid endpoint id status = %d", rec.Code)
+	}
+	_ = db
+}
+
+func TestHealthzWalletWriteMode(t *testing.T) {
+	h, _ := newEndpointTestHandler(t)
+	r := gin.New()
+	h.RegisterRoutes(r)
+
+	// 默认 shared。
+	t.Setenv("CODEX_WALLET_WRITE_MODE", "")
+	t.Setenv("CODEX_ENDPOINT_REGION", "")
+	t.Setenv("CODEX_WALLET_PRIMARY_REGION", "")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if got := gjson.Get(rec.Body.String(), "wallet_write").String(); got != "shared" {
+		t.Fatalf("default wallet_write = %q", got)
+	}
+
+	// primary 且本端点为主区 → primary。
+	t.Setenv("CODEX_WALLET_WRITE_MODE", "primary")
+	t.Setenv("CODEX_ENDPOINT_REGION", "hk")
+	t.Setenv("CODEX_WALLET_PRIMARY_REGION", "hk")
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if got := gjson.Get(rec.Body.String(), "wallet_write").String(); got != "primary" {
+		t.Fatalf("primary wallet_write = %q", got)
+	}
+
+	// primary 但非主区 → readonly。
+	t.Setenv("CODEX_ENDPOINT_REGION", "sg")
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if got := gjson.Get(rec.Body.String(), "wallet_write").String(); got != "readonly" {
+		t.Fatalf("readonly wallet_write = %q", got)
 	}
 }

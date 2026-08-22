@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"os"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -16,6 +17,7 @@ type EnhancedProxyPool struct {
 	db          *database.DB
 	enabled     atomic.Bool
 	initialized atomic.Bool
+	region      string // 本端点地区（P7.4：同区出口优先 + 通用兜底）
 }
 
 // NewEnhancedProxyPool 创建增强代理池
@@ -24,6 +26,11 @@ func NewEnhancedProxyPool(db *database.DB, config *ProxyPoolConfig) *EnhancedPro
 		pool: NewProxyPool(config),
 		db:   db,
 	}
+}
+
+// SetRegion 设置本端点地区（env CODEX_ENDPOINT_REGION）。
+func (e *EnhancedProxyPool) SetRegion(region string) {
+	e.region = strings.TrimSpace(region)
 }
 
 // Init 初始化代理池
@@ -38,7 +45,7 @@ func (e *EnhancedProxyPool) Init(ctx context.Context) error {
 		return err
 	}
 
-	// 添加到代理池
+	// 添加到代理池（携带 P7.4 地区/优先级路由元数据）
 	for _, p := range proxies {
 		// 使用延迟作为权重的基础（延迟越低，权重越高）
 		weight := int64(100)
@@ -49,7 +56,7 @@ func (e *EnhancedProxyPool) Init(ctx context.Context) error {
 				weight = 1
 			}
 		}
-		e.pool.AddProxy(p.URL, weight)
+		e.pool.AddProxyWithRouting(p.URL, weight, p.Region, p.Priority)
 	}
 
 	// 设置回调
@@ -86,17 +93,31 @@ func (e *EnhancedProxyPool) SetEnabled(enabled bool) {
 	e.enabled.Store(enabled)
 }
 
-// NextProxy 获取下一个代理（兼容原有接口）
+// NextProxy 获取下一个代理（兼容原有接口）。
+// P7.4：本端点配置了地区时，同区代理优先（按优先级），通用代理（region 空）兜底；
+// 未配置地区保持原全局轮询行为。
 func (e *EnhancedProxyPool) NextProxy() string {
 	if !e.enabled.Load() || !e.initialized.Load() {
 		return ""
 	}
 
-	entry := e.pool.Select()
-	if entry == nil {
-		return ""
+	region := e.region
+	if region == "" {
+		entry := e.pool.Select()
+		if entry == nil {
+			return ""
+		}
+		return entry.URL
 	}
-	return entry.URL
+
+	// 同区优先（含优先级排序），再通用兜底。
+	if entry := e.pool.SelectFiltered(func(pe *ProxyEntry) bool { return pe.Region == region }); entry != nil {
+		return entry.URL
+	}
+	if entry := e.pool.SelectFiltered(func(pe *ProxyEntry) bool { return pe.Region == "" }); entry != nil {
+		return entry.URL
+	}
+	return ""
 }
 
 // SelectWithStrategy 使用指定策略选择代理
@@ -298,6 +319,9 @@ func NewStoreProxyPoolIntegration(store *Store, db *database.DB, settings *datab
 		}
 
 		integration.enhancedPool = NewEnhancedProxyPool(db, config)
+		// P7.4：本端点地区（与 P7.1 节点注册的 CODEX_ENDPOINT_REGION 同源），
+		// 同区出口优先、通用代理兜底。
+		integration.enhancedPool.SetRegion(getEnv("CODEX_ENDPOINT_REGION", ""))
 		integration.useEnhanced.Store(true)
 	}
 

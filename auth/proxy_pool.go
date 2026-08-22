@@ -45,6 +45,9 @@ type ProxyEntry struct {
 	Status         ProxyHealthStatus
 	IsolatedAt     time.Time
 	ConsecutiveFailures int
+	// P7.4：出口池路由元数据（Init 时从 DB 填充，只读）。
+	Region   string // 地区（空 = 通用兜底）
+	Priority int    // 优先级（同区内越大越优先）
 
 	mu sync.RWMutex
 }
@@ -144,6 +147,11 @@ func NewProxyPool(config *ProxyPoolConfig) *ProxyPool {
 
 // AddProxy 添加代理到池
 func (p *ProxyPool) AddProxy(url string, weight int64) {
+	p.AddProxyWithRouting(url, weight, "", 0)
+}
+
+// AddProxyWithRouting 添加代理并携带 P7.4 路由元数据（region/priority）。
+func (p *ProxyPool) AddProxyWithRouting(url string, weight int64, region string, priority int) {
 	if url == "" {
 		return
 	}
@@ -166,6 +174,8 @@ func (p *ProxyPool) AddProxy(url string, weight int64) {
 		SuccessRate: 1.0,
 		Weight:      weight,
 		Status:      ProxyStatusHealthy,
+		Region:      region,
+		Priority:    priority,
 	}
 
 	p.proxies = append(p.proxies, entry)
@@ -242,6 +252,38 @@ func (p *ProxyPool) SelectWithStrategy(strategy ProxySelectionStrategy) *ProxyEn
 	}
 
 	return p.selectByStrategy(strategy)
+}
+
+// SelectFiltered 在健康代理中按谓词选择第一个匹配（P7.4 地区/优先级路由）。
+// 从当前轮询位置起线性扫描，优先返回 priority 高的匹配项；无匹配返回 nil。
+func (p *ProxyPool) SelectFiltered(predicate func(*ProxyEntry) bool) *ProxyEntry {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if predicate == nil {
+		return p.selectByStrategy(p.strategy)
+	}
+	idx := int(atomic.AddUint64(&p.roundRobinIdx, 1) - 1)
+	healthy := p.healthy
+	if len(healthy) == 0 {
+		return nil
+	}
+	// 第一遍：从 idx 起找优先级最高的匹配项。
+	best := -1
+	bestPriority := -1 << 30
+	for i := 0; i < len(healthy); i++ {
+		e := healthy[(idx+i)%len(healthy)]
+		if !predicate(e) {
+			continue
+		}
+		if e.Priority > bestPriority {
+			best = (idx + i) % len(healthy)
+			bestPriority = e.Priority
+		}
+	}
+	if best >= 0 {
+		return healthy[best]
+	}
+	return nil
 }
 
 // selectByStrategy 根据策略选择代理

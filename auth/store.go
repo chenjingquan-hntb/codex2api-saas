@@ -3100,6 +3100,7 @@ type Store struct {
 	autoCleanError                     atomic.Bool
 	autoCleanExpired                   atomic.Bool
 	lazyMode                           atomic.Bool
+	endpointID                         string // P7.3：本端点 ID（空 = 单机模式，加载全量账号）
 	autoCleanupBatch                   atomic.Bool
 	maxRetries                         int64 // 请求失败最大重试次数（换号重试）
 	maxRateLimitRetries                int64 // 429 最大换号重试次数
@@ -4529,6 +4530,12 @@ func (s *Store) SetLazyMode(enabled bool) {
 	s.rebuildFastScheduler()
 }
 
+// SetEndpointID 设置本端点 ID（P7.3 端点授权：账号加载按端点过滤）。
+// 未设置（单机/未配置节点身份）时加载全量账号，行为不变。
+func (s *Store) SetEndpointID(endpointID string) {
+	s.endpointID = strings.TrimSpace(endpointID)
+}
+
 // SetBackgroundRefreshInterval 设置后台刷新/探针巡检间隔。
 func (s *Store) SetBackgroundRefreshInterval(d time.Duration) {
 	if d <= 0 {
@@ -4676,7 +4683,14 @@ func (s *Store) Init(ctx context.Context) error {
 
 // loadFromDB 从数据库加载账号
 func (s *Store) loadFromDB(ctx context.Context) error {
-	rows, err := s.db.ListActive(ctx)
+	var rows []*database.AccountRow
+	var err error
+	if s.endpointID != "" {
+		// P7.3：按端点授权过滤（仅加载"分组允许本端点"的账号）。
+		rows, err = s.db.ListActiveByChannelForEndpoint(ctx, "", s.endpointID)
+	} else {
+		rows, err = s.db.ListActive(ctx)
+	}
 	if err != nil {
 		return fmt.Errorf("从数据库加载账号失败: %w", err)
 	}

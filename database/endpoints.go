@@ -31,6 +31,7 @@ const (
 var (
 	ErrEndpointNotFound = errors.New("endpoints: not found")
 	ErrEndpointRevoked  = errors.New("endpoints: revoked")
+	ErrGroupNotFound    = errors.New("account groups: not found")
 )
 
 // ServiceEndpoint 是 P7 多端点控制面的节点记录。
@@ -52,6 +53,9 @@ type ServiceEndpoint struct {
 	RevokedAt   *time.Time `json:"revoked_at,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
 	UpdatedAt   time.Time  `json:"updated_at"`
+	// P7.3/P7.5 管理视图：绑定分组（列表接口填充，不作为持久化字段）。
+	BoundGroups     []EndpointGroupSummary `json:"bound_groups,omitempty"`
+	BoundGroupCount int                    `json:"bound_group_count,omitempty"`
 }
 
 // heartbeatTimeout 心跳超时阈值：超过该时长未心跳视为 offline（展示判定）。
@@ -214,6 +218,13 @@ func (db *DB) ListServiceEndpoints(ctx context.Context, endpointID string) ([]Se
 		return nil, err
 	}
 	return out, nil
+}
+
+// EndpointGroupSummary 是端点绑定分组摘要（P7.3/P7.5 管理视图）。
+type EndpointGroupSummary struct {
+	GroupID    int64  `json:"group_id"`
+	GroupName  string `json:"group_name"`
+	AccountCnt int64  `json:"account_cnt"`
 }
 
 // ExpireStaleEndpoints 把心跳超时的 active 节点落库为 offline（后台清理，

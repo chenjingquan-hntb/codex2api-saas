@@ -36,6 +36,7 @@ type accountGroupResponse struct {
 	AutoPause7dThreshold    float64  `json:"auto_pause_7d_threshold"`
 	ProxyURLs               []string `json:"proxy_urls"`
 	Channel                 string   `json:"channel"`
+	EndpointIDs             []string `json:"endpoint_ids"` // P7.3：允许使用该分组的端点（空 = 全端点）
 	CreatedAt               string   `json:"created_at"`
 	UpdatedAt               string   `json:"updated_at"`
 }
@@ -57,6 +58,7 @@ func toAccountGroupResponse(g database.AccountGroup) accountGroupResponse {
 		AutoPause7dThreshold:    g.AutoPause7dThreshold,
 		ProxyURLs:               proxyURLs,
 		Channel:                 database.NormalizeAccountGroupChannel(g.Channel),
+		EndpointIDs:             g.EndpointIDs,
 		CreatedAt:               g.CreatedAt.Format(time.RFC3339),
 		UpdatedAt:               g.UpdatedAt.Format(time.RFC3339),
 	}
@@ -233,6 +235,8 @@ type updateAccountGroupReq struct {
 	ProxyURLs *[]string `json:"proxy_urls"`
 	// Channel 缺省表示不修改;仅空组允许改渠道。
 	Channel *string `json:"channel"`
+	// EndpointIDs 缺省(null)表示不修改;空数组表示全端点可见（P7.3）。
+	EndpointIDs *[]string `json:"endpoint_ids"`
 }
 
 func (h *Handler) UpdateAccountGroup(c *gin.Context) {
@@ -299,6 +303,16 @@ func (h *Handler) UpdateAccountGroup(c *gin.Context) {
 		normalized := database.NormalizeAccountGroupChannel(*req.Channel)
 		req.Channel = &normalized
 	}
+	// P7.3：校验端点 ID 格式（非空、≤64、无空白）。
+	if req.EndpointIDs != nil {
+		for _, ep := range *req.EndpointIDs {
+			ep = strings.TrimSpace(ep)
+			if ep == "" || len(ep) > 64 || strings.ContainsAny(ep, " \t\n\r") {
+				writeError(c, http.StatusBadRequest, "endpoint_ids 含非法端点 ID")
+				return
+			}
+		}
+	}
 	var opts *database.UpdateAccountGroupOpts
 	if req.AutoPause5hThreshold != nil || req.AutoPause7dThreshold != nil || baseConcurrencyOverride.Set || req.ProxyURLs != nil || req.Channel != nil {
 		opts = &database.UpdateAccountGroupOpts{
@@ -336,6 +350,16 @@ func (h *Handler) UpdateAccountGroup(c *gin.Context) {
 		}
 		writeInternalError(c, err)
 		return
+	}
+
+	// P7.3：分组↔端点绑定（授权隔离）。
+	if req.EndpointIDs != nil {
+		if err := h.db.SetGroupEndpointIDs(ctx, id, *req.EndpointIDs); err != nil {
+			writeInternalError(c, err)
+			return
+		}
+		security.SecurityAuditLog("ADMIN_GROUP_ENDPOINTS_UPDATED",
+			fmt.Sprintf("group_id=%d endpoint_ids=%v ip=%s", id, *req.EndpointIDs, security.SanitizeLog(c.ClientIP())))
 	}
 	if opts != nil && h.store != nil && (opts.AutoPause5hThreshold != nil || opts.AutoPause7dThreshold != nil) {
 		t5h, t7d := h.store.GetGroupAutoPauseThresholds(id)

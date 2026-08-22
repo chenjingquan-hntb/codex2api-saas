@@ -24,6 +24,8 @@ type AccountGroup struct {
 	// Channel 是分组渠道(codex/grok/anthropic,issue #487):分组按渠道隔离,
 	// 成员写入路径会校验账号平台与组渠道一致。
 	Channel   string
+	// EndpointIDs 是允许使用该分组的端点 ID 列表（P7.3；空 = 全端点可见）。
+	EndpointIDs []string
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }
@@ -53,6 +55,7 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 			COALESCE(g.auto_pause_5h_threshold, 0), COALESCE(g.auto_pause_7d_threshold, 0),
 			COALESCE(g.proxy_urls, '[]'),
 			COALESCE(g.channel, 'codex'),
+			COALESCE(g.endpoint_ids, '[]'),
 			g.created_at, g.updated_at
 		FROM account_groups g
 		LEFT JOIN account_group_members m ON m.group_id = g.id
@@ -60,7 +63,7 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 			AND a.status <> 'deleted'
 			AND COALESCE(a.error_message, '') <> 'deleted'
 		GROUP BY g.id, g.name, g.description, g.color, g.sort_order, g.base_concurrency_override,
-			g.auto_pause_5h_threshold, g.auto_pause_7d_threshold, g.proxy_urls, g.channel, g.created_at, g.updated_at
+			g.auto_pause_5h_threshold, g.auto_pause_7d_threshold, g.proxy_urls, g.channel, g.endpoint_ids, g.created_at, g.updated_at
 		ORDER BY g.sort_order, g.name`)
 	if err != nil {
 		return nil, err
@@ -69,11 +72,20 @@ func (db *DB) ListAccountGroups(ctx context.Context) ([]AccountGroup, error) {
 	groups := make([]AccountGroup, 0)
 	for rows.Next() {
 		var g AccountGroup
-		var createdRaw, updatedRaw, proxyRaw interface{}
-		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.Color, &g.SortOrder, &g.BaseConcurrencyOverride, &g.MemberCount, &g.AutoPause5hThreshold, &g.AutoPause7dThreshold, &proxyRaw, &g.Channel, &createdRaw, &updatedRaw); err != nil {
+		var createdRaw, updatedRaw, proxyRaw, endpointRaw interface{}
+		if err := rows.Scan(&g.ID, &g.Name, &g.Description, &g.Color, &g.SortOrder, &g.BaseConcurrencyOverride, &g.MemberCount, &g.AutoPause5hThreshold, &g.AutoPause7dThreshold, &proxyRaw, &g.Channel, &endpointRaw, &createdRaw, &updatedRaw); err != nil {
 			return nil, err
 		}
 		g.ProxyURLs = decodeTagsValue(proxyRaw)
+		if rawStr, ok := endpointRaw.(string); ok {
+			if ids, err := parseEndpointIDs(rawStr); err == nil {
+				g.EndpointIDs = ids
+			}
+		} else if rawStr, ok := endpointRaw.([]byte); ok {
+			if ids, err := parseEndpointIDs(string(rawStr)); err == nil {
+				g.EndpointIDs = ids
+			}
+		}
 		g.Channel = NormalizeAccountGroupChannel(g.Channel)
 		var parseErr error
 		g.CreatedAt, parseErr = parseDBTimeValue(createdRaw)

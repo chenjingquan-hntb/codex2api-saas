@@ -314,6 +314,8 @@ func main() {
 
 	// 5. 初始化账号管理器
 	store := auth.NewStore(db, tc, settings)
+	// P7.3 端点授权：本端点只加载"分组允许本端点"的账号（凭证/账号按端点隔离）。
+	store.SetEndpointID(os.Getenv("CODEX_ENDPOINT_ID"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	if err := store.Init(ctx); err != nil {

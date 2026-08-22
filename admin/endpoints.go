@@ -15,6 +15,7 @@ import (
 
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/version"
+	"github.com/codex2api/proxy"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
@@ -182,10 +183,67 @@ func (h *Handler) ListAdminEndpoints(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
+	// P7.3/P7.5：附端点↔分组绑定与账号规模（管理视图）。
+	bindings, err := h.db.ListEndpointGroupBindings(ctx)
+	if err != nil {
+		bindings = nil
+	}
+	byEndpoint := make(map[string][]database.EndpointGroupSummary)
+	for _, b := range bindings {
+		byEndpoint[b.EndpointID] = append(byEndpoint[b.EndpointID], database.EndpointGroupSummary{
+			GroupID: b.GroupID, GroupName: b.GroupName, AccountCnt: b.AccountCnt,
+		})
+	}
+	for i := range eps {
+		eps[i].BoundGroups = byEndpoint[eps[i].EndpointID]
+		eps[i].BoundGroupCount = len(eps[i].BoundGroups)
+	}
 	if eps == nil {
 		eps = []database.ServiceEndpoint{}
 	}
 	c.JSON(http.StatusOK, gin.H{"endpoints": eps, "count": len(eps)})
+}
+
+// EndpointOverview GET /api/admin/endpoints/:endpoint_id/overview
+// 端点全景视图（P7.5 GSLB 衔接的代码侧）：状态/地区/绑定分组/可见账号数/钱包写模式。
+func (h *Handler) EndpointOverview(c *gin.Context) {
+	if h == nil || h.db == nil {
+		writeError(c, http.StatusServiceUnavailable, "服务未就绪")
+		return
+	}
+	endpointID := strings.TrimSpace(c.Param("endpoint_id"))
+	if endpointID == "" {
+		writeError(c, http.StatusBadRequest, "缺少 endpoint_id")
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+	ep, err := h.db.GetServiceEndpoint(ctx, endpointID)
+	if err != nil {
+		if errors.Is(err, database.ErrEndpointNotFound) {
+			writeError(c, http.StatusNotFound, "节点不存在")
+			return
+		}
+		writeInternalError(c, err)
+		return
+	}
+	groups, err := h.db.ListGroupsForEndpoint(ctx, endpointID)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	// 可见账号数：与该端点同渠道口径一致（本端点授权视图）。
+	accounts, err := h.db.ListActiveByChannelForEndpoint(ctx, "", endpointID)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"endpoint":         ep,
+		"allowed_group_ids": groups,
+		"visible_accounts":  len(accounts),
+		"wallet_write":      proxyWalletWriteMode(),
+	})
 }
 
 // AdminUpsertEndpoint POST /api/admin/endpoints
@@ -295,8 +353,22 @@ type healthzResponse struct {
 	EndpointID   string                  `json:"endpoint_id,omitempty"`
 	Version      string                  `json:"version,omitempty"`
 	UptimeSec    int64                   `json:"uptime_seconds"`
+	WalletWrite  string                  `json:"wallet_write,omitempty"` // shared / primary / readonly（P7.6）
 	Dependencies map[string]string       `json:"dependencies"`
 	Details      map[string]string       `json:"details,omitempty"`
+}
+
+// proxyWalletWriteMode 汇总钱包写模式供 /healthz 展示：
+// shared → "shared"；primary 且本端点为主区 → "primary"；primary 但非主区 → "readonly"。
+func proxyWalletWriteMode() string {
+	mode := proxy.WalletWriteMode()
+	if mode == proxy.WalletWriteModeShared {
+		return "shared"
+	}
+	if proxy.WalletWriteEnabled() {
+		return "primary"
+	}
+	return "readonly"
 }
 
 // GetHealthz GET /healthz
@@ -309,6 +381,7 @@ func (h *Handler) GetHealthz(c *gin.Context) {
 		EndpointID:   endpointIDFromEnv(),
 		Version:      versionForHealthz(),
 		UptimeSec:    int64(time.Since(processStartTime).Seconds()),
+		WalletWrite:  proxyWalletWriteMode(),
 		Dependencies: map[string]string{},
 		Details:      map[string]string{},
 	}

@@ -1101,6 +1101,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	})
 	// P7.1 多端点控制面：节点列表与生命周期管理。
 	api.GET("/endpoints", h.ListAdminEndpoints)
+	api.GET("/endpoints/:endpoint_id/overview", h.EndpointOverview)
 	api.POST("/endpoints", h.AdminUpsertEndpoint)
 	api.POST("/endpoints/:endpoint_id/drain", h.AdminDrainEndpoint)
 	api.POST("/endpoints/:endpoint_id/activate", h.AdminActivateEndpoint)
@@ -11819,9 +11820,11 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 	}
 
 	var req struct {
-		URL     *string `json:"url"`
-		Label   *string `json:"label"`
-		Enabled *bool   `json:"enabled"`
+		URL      *string `json:"url"`
+		Label    *string `json:"label"`
+		Enabled  *bool   `json:"enabled"`
+		Region   *string `json:"region"`   // P7.4
+		Priority *int    `json:"priority"` // P7.4
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		writeError(c, http.StatusBadRequest, "请求格式错误")
@@ -11857,6 +11860,14 @@ func (h *Handler) UpdateProxy(c *gin.Context) {
 		}
 		writeError(c, http.StatusInternalServerError, "更新代理失败")
 		return
+	}
+
+	// P7.4：地区/优先级独立更新（不影响既有字段）。
+	if req.Region != nil || req.Priority != nil {
+		if err := h.db.SetProxyRouting(ctx, id, req.Region, req.Priority); err != nil {
+			writeError(c, http.StatusInternalServerError, "更新代理路由配置失败")
+			return
+		}
 	}
 
 	newURL := oldURL

@@ -306,3 +306,48 @@ func TestWalletBillingExemptPaths(t *testing.T) {
 		}
 	}
 }
+
+func TestWalletWriteModeDecision(t *testing.T) {
+	// 默认 shared → 可写。
+	t.Setenv("CODEX_WALLET_WRITE_MODE", "")
+	t.Setenv("CODEX_ENDPOINT_REGION", "")
+	t.Setenv("CODEX_WALLET_PRIMARY_REGION", "")
+	if got := WalletWriteMode(); got != WalletWriteModeShared {
+		t.Fatalf("default mode = %q", got)
+	}
+	if !WalletWriteEnabled() {
+		t.Fatal("shared mode must be writable")
+	}
+
+	// primary + 主区 → 可写。
+	t.Setenv("CODEX_WALLET_WRITE_MODE", "primary")
+	t.Setenv("CODEX_ENDPOINT_REGION", "hk")
+	t.Setenv("CODEX_WALLET_PRIMARY_REGION", "hk")
+	if got := WalletWriteMode(); got != WalletWriteModePrimary {
+		t.Fatalf("primary mode = %q", got)
+	}
+	if !WalletWriteEnabled() {
+		t.Fatal("primary-region endpoint must be writable")
+	}
+
+	// primary + 非主区 → 只读。
+	t.Setenv("CODEX_ENDPOINT_REGION", "sg")
+	if WalletWriteEnabled() {
+		t.Fatal("non-primary endpoint must be read-only")
+	}
+
+	// primary + 未配置主区 → 只读（fail-closed）。
+	t.Setenv("CODEX_WALLET_PRIMARY_REGION", "")
+	if WalletWriteEnabled() {
+		t.Fatal("missing primary region must be read-only")
+	}
+
+	// 未知模式 → 回落 shared。
+	t.Setenv("CODEX_WALLET_WRITE_MODE", "banana")
+	if got := WalletWriteMode(); got != WalletWriteModeShared {
+		t.Fatalf("unknown mode = %q", got)
+	}
+	if !WalletWriteEnabled() {
+		t.Fatal("unknown mode must fall back to shared-writable")
+	}
+}
