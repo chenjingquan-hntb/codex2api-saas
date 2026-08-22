@@ -14,7 +14,8 @@
     "images": "Images",
     "promptFilter": "Prompt Filter",
     "modelPricing": "Model Pricing",
-    "payloadRules": "Payload Rules"
+    "payloadRules": "Payload Rules",
+    "controlPanel": "Control Panel"
   },
   "grok": {
     "pageTitle": "Grok Accounts",

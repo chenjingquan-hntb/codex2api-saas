@@ -3125,3 +3125,60 @@ export interface ObservedInstructionsSample {
 export interface ObservedInstructionsResponse {
   samples: ObservedInstructionsSample[]
 }
+
+// ==================== 控制面配置（P5/P6） ====================
+
+export interface BillingConfig {
+  enabled: boolean
+  deposit_micro: number
+  min_charge_micro: number
+  charge_cap_micro: number
+  cny_per_usd: number
+}
+
+export interface SMTPConfig {
+  enabled: boolean
+  host: string
+  port: number
+  security: string
+  username: string
+  password: string
+  from: string
+  from_name: string
+  insecure_skip_verify: boolean
+}
+
+export interface EpayConfig {
+  enabled: boolean
+  merchant_id: string
+  key: string
+  gateway_url: string
+  callback_base_url: string
+  notify_path: string
+  return_path: string
+}
+
+export interface TurnstileConfig {
+  enabled: boolean
+  site_key: string
+  secret_key: string
+}
+
+export interface GeoIPConfig {
+  enabled: boolean
+  provider: string
+  api_key: string
+  mode: string
+  countries: string[]
+  cache_ttl_minutes: number
+}
+
+export interface ControlSettings {
+  billing: BillingConfig
+  smtp: SMTPConfig
+  epay: EpayConfig
+  turnstile: TurnstileConfig
+  geoip: GeoIPConfig
+}
+
+export type ControlSettingSection = 'billing' | 'smtp' | 'epay' | 'turnstile' | 'geoip'

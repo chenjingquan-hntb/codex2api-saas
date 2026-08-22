@@ -27,6 +27,7 @@ const PromptFilter = lazy(() => import('./pages/PromptFilter'))
 const ThemeSettings = lazy(() => import('./pages/ThemeSettings'))
 const ModelPricing = lazy(() => import('./pages/ModelPricing'))
 const PayloadRules = lazy(() => import('./pages/PayloadRules'))
+const ControlPanel = lazy(() => import('./pages/ControlPanel'))
 
 export default function App() {
   return (
@@ -78,6 +79,7 @@ function AdminApp() {
           <Route path="/payload-rules/:view" element={<PayloadRules />} />
           <Route path="/theme" element={<ThemeSettings />} />
           <Route path="/settings" element={<Settings />} />
+          <Route path="/control-panel" element={<ControlPanel />} />
           <Route path="/docs" element={<Docs />} />
           <Route path="/guide" element={<Navigate to="/docs" replace />} />
           <Route path="/api-reference" element={<Navigate to="/docs#model-api" replace />} />

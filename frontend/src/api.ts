@@ -86,6 +86,8 @@ import type {
   WhamDailyUsageResponse,
   RuntimeStatusResponse,
   SiteBranding,
+  ControlSettings,
+  ControlSettingSection,
   StatsResponse,
   SystemUpdateInfo,
   SystemUpdateResult,
@@ -1321,4 +1323,19 @@ export interface ProxyTestResult {
   latency_ms?: number
   location?: string
   error?: string
+}
+
+// 控制面配置（P5/P6）：钱包计费 / SMTP / 易支付 / Turnstile / GeoIP
+export const controlSettings = {
+  get: () => request<ControlSettings>('/api/admin/control-settings'),
+  update: (section: ControlSettingSection, value: Record<string, unknown>) =>
+    request<{ key: string; value: Record<string, unknown> }>(`/api/admin/control-settings/${section}`, {
+      method: 'PUT',
+      body: JSON.stringify(value),
+    }),
+  testSMTP: (to: string) =>
+    request<{ sent: boolean; to: string }>('/api/admin/control-settings/smtp/test', {
+      method: 'POST',
+      body: JSON.stringify({ to }),
+    }),
 }

@@ -14,7 +14,8 @@
     "images": "生图工作台",
     "promptFilter": "Prompt 检查",
     "modelPricing": "模型定价",
-    "payloadRules": "请求体重写"
+    "payloadRules": "请求体重写",
+    "controlPanel": "控制面配置"
   },
   "grok": {
     "pageTitle": "Grok 账号",
